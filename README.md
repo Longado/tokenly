@@ -31,6 +31,18 @@ TOTAL                      2,001,200     370,000    48,000,000     900,000    51
 ```
 *(sample numbers)*
 
+## Desktop widget (macOS)
+
+A desktop widget for [Übersicht](https://tracesof.net/uebersicht/) lives in `widgets/tokenmeter.widget`.
+It shows today's and last-30-day cost plus a per-model breakdown, refreshing every 5 minutes.
+
+```bash
+brew install --cask ubersicht
+ln -s "$PWD/widgets/tokenmeter.widget" ~/Library/Application\ Support/Übersicht/widgets/
+```
+
+The widget runs `tokenmeter 30 --json`; if `tokenmeter` is not on your PATH, edit `TOKENMETER` at the top of `index.jsx`.
+
 ## Data sources
 
 | Tool | Path | Notes |
