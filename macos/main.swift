@@ -776,7 +776,7 @@ struct WidgetView: View {
     var header: some View {
         HStack(spacing: 7) {
             HStack(spacing: 5) {
-                Image(nsImage: logoImage(points: fs(16), template: false)).interpolation(.none)
+                Image(nsImage: logoImage(points: fs(20), template: false)).interpolation(.none)
                 Text("TOKENLY").font(.system(size: fs(11), weight: .semibold).width(.expanded)).tracking(0.8)
                     .fixedSize()
             }
@@ -1531,56 +1531,42 @@ struct SettingsView: View {
 
 // MARK: - Logo
 
-/// 16×16 pixel-art token: o outline, v body, d shade, l highlight, w the "T".
-let logoPixels = [
-    "................",
-    ".....oooooo.....",
-    "...oovvvvvvoo...",
-    "..ovvllvvvvvvo..",
-    "..ovlvvvvvvvvo..",
-    ".ovvwwwwwwwwvvo.",
-    ".ovvwwwwwwwwvvo.",
-    ".ovvvvvwwvvvvvo.",
-    ".ovvvvvwwvvvvvo.",
-    ".ovvvvvwwvvvvvo.",
-    ".ovvvvvwwvvvvdo.",
-    "..ovvvvwwvvvdo..",
-    "..ovvvvwwvvddo..",
-    "...oovvvvvddo...",
-    ".....oooooo.....",
-    "................",
-]
-let logoColors: [Character: NSColor] = [
-    "o": NSColor(red: 0.16, green: 0.13, blue: 0.25, alpha: 1),
-    "v": NSColor(red: 0.67, green: 0.58, blue: 1.0, alpha: 1),
-    "d": NSColor(red: 0.49, green: 0.41, blue: 0.84, alpha: 1),
-    "l": NSColor(red: 0.89, green: 0.86, blue: 1.0, alpha: 1),
-    "w": NSColor.white,
-]
+/// The Tokenly mark, on an 11×10 pixel grid (y = 0 at the top): a terminal block with a green ">" prompt,
+/// a pixel "T" and a green "_" cursor.
+enum Mark {
+    static let w = 11, h = 10
+    static let prompt = [(1, 2), (2, 3), (1, 4)]
+    static let t = [(4, 2), (5, 2), (6, 2), (7, 2), (8, 2), (6, 3), (6, 4), (6, 5), (6, 6), (6, 7)]
+    static let cursor = [(8, 7), (9, 7)]
+    static let green = NSColor(red: 0.49, green: 1.0, blue: 0.70, alpha: 1)
+}
 
-/// Draws the pixel logo with hard edges into a `px`-pixel square, optionally on the app-icon tile.
+/// Draws the mark into a `px` square. `template`: solid block with the glyphs cut out (menu bar).
+/// `tile`: the app icon, with the mark on a light rounded tile. Otherwise: the panel header version.
 func drawLogo(px: CGFloat, template: Bool = false, tile: Bool = false) {
-    let ctx = NSGraphicsContext.current
-    ctx?.imageInterpolation = .none
-    ctx?.shouldAntialias = false
-    var inset: CGFloat = 0
+    guard let ctx = NSGraphicsContext.current else { return }
+    var area = px
     if tile {
-        ctx?.shouldAntialias = true
+        ctx.shouldAntialias = true
         let r = NSRect(x: px * 0.1, y: px * 0.1, width: px * 0.8, height: px * 0.8)
-        NSColor(red: 0.08, green: 0.08, blue: 0.11, alpha: 1).setFill()
-        NSBezierPath(roundedRect: r, xRadius: px * 0.18, yRadius: px * 0.18).fill()
-        ctx?.shouldAntialias = false
-        inset = px * 0.18
+        let path = NSBezierPath(roundedRect: r, xRadius: px * 0.18, yRadius: px * 0.18)
+        NSGradient(starting: NSColor(white: 0.98, alpha: 1), ending: NSColor(white: 0.89, alpha: 1))!.draw(in: path, angle: -90)
+        area = px * 0.5
     }
-    let cell = ((px - 2 * inset) / 16).rounded(.down)
-    let origin = (px - cell * 16) / 2
-    for (row, line) in logoPixels.enumerated() {
-        for (col, ch) in line.enumerated() {
-            // Template (menu bar): only the ring and the T, so it reads as an outline icon.
-            guard let color = template ? (ch == "o" || ch == "w" ? NSColor.black : nil) : logoColors[ch] else { continue }
-            color.setFill()
-            NSRect(x: origin + CGFloat(col) * cell, y: origin + CGFloat(15 - row) * cell, width: cell, height: cell).fill()
-        }
+    ctx.shouldAntialias = false
+    let cell = max(0.5, (area * 2 / CGFloat(Mark.w)).rounded(.down) / 2) // half points = whole pixels on Retina
+    let ox = ((px - cell * CGFloat(Mark.w)) / 2).rounded(.down), oy = ((px - cell * CGFloat(Mark.h)) / 2).rounded(.down)
+    let rect = { (x: Int, y: Int) in NSRect(x: ox + CGFloat(x) * cell, y: oy + CGFloat(Mark.h - 1 - y) * cell, width: cell, height: cell) }
+    let block = NSRect(x: ox, y: oy, width: cell * CGFloat(Mark.w), height: cell * CGFloat(Mark.h))
+    (template ? NSColor.black : tile ? NSColor(white: 0.07, alpha: 1) : NSColor(white: 0.93, alpha: 1)).setFill()
+    block.fill()
+    for (x, y) in Mark.t {
+        if template { rect(x, y).fill(using: .clear) }
+        else { (tile ? NSColor.white : NSColor(white: 0.09, alpha: 1)).setFill(); rect(x, y).fill() }
+    }
+    for (x, y) in Mark.prompt + Mark.cursor {
+        if template { rect(x, y).fill(using: .clear) }
+        else { (tile ? Mark.green : NSColor(red: 0.12, green: 0.62, blue: 0.36, alpha: 1)).setFill(); rect(x, y).fill() }
     }
 }
 
@@ -1665,7 +1651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildWindow()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "TM"
-        statusItem.button?.image = logoImage(points: 16, template: true)
+        statusItem.button?.image = logoImage(points: 17, template: true)
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusClicked)
@@ -1761,7 +1747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Two small lines in one status item, drawn by SwiftUI (clicks pass through to the button).
             let top = usd(t.cost) + (title.contains("%") ? " · \(Int((q?.peak ?? 0).rounded()))%" : "")
             let view = AnyView(HStack(spacing: 3) {
-                Image(nsImage: logoImage(points: 16, template: true)).renderingMode(.template)
+                Image(nsImage: logoImage(points: 17, template: true)).renderingMode(.template)
                 VStack(alignment: .leading, spacing: -2) {
                     Text(top).font(.system(size: 9.5, weight: .semibold).monospacedDigit())
                         .foregroundColor(alert.map { Color(nsColor: $0) } ?? .primary)
@@ -1784,7 +1770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stackedView?.removeFromSuperview()
         stackedView = nil
         statusItem.length = NSStatusItem.variableLength
-        button.image = logoImage(points: 16, template: true)
+        button.image = logoImage(points: 17, template: true)
         button.attributedTitle = NSAttributedString(string: title, attributes: attrs)
     }
 

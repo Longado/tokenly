@@ -25,6 +25,14 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.21.0 — new mark: Prompt T_
+- **New logo.** Picked from three candidate rounds (`docs/logo-candidates*.png`), in the monochrome pixel-type spirit of Vibe Usage's mark: a black terminal block with a green `>` prompt, a pixel **T** and a green `_` cursor, on an 11×10 grid.
+- **Where it's used.**
+  - App icon: the mark on a light rounded tile.
+  - Menu bar: a template image, a solid block with the glyphs cut out.
+  - Panel header: a light block with a dark T.
+- **Sharp at small sizes.** Cells snap to half points, so every logo pixel is a whole screen pixel on Retina.
+
 ### v0.20.0 — provider-split charts and a logo
 - **Provider split.** Trend bars stack by provider in the provider colors, in cost or token mode, with a legend. While hovering, the legend shows each provider's value for that bar. Time mode stays one color, because active time can't be split. Settings → Overview shows → "Split chart by provider".
 - **Logo.** A 16×16 pixel-art token (violet coin with a pixel "T").
