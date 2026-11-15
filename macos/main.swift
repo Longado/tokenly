@@ -506,6 +506,12 @@ final class Prefs: ObservableObject {
     /// Read-only import of the user's other devices from their Vibe Usage account.
     @Published var includeOtherDevices: Bool { didSet { ud.set(includeOtherDevices, forKey: "includeOtherDevices"); onDataChange?() } }
     var onDataChange: (() -> Void)?
+    static let textScales: [CGFloat] = [1.0, 1.15, 1.3]
+    /// One step smaller (-1) or larger (+1).
+    func stepText(_ d: Int) {
+        let i = Prefs.textScales.firstIndex(of: textScale) ?? 1
+        textScale = Prefs.textScales[max(0, min(Prefs.textScales.count - 1, i + d))]
+    }
     /// Panel text size: 1.0 default, 1.15 large, 1.3 larger.
     @Published var textScale: CGFloat { didSet { ud.set(Double(textScale), forKey: "textScale"); onChange?() } }
     @Published var launchAtLogin: Bool {
@@ -1256,6 +1262,12 @@ struct WidgetView: View {
             }
             Spacer()
             cap("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")")
+            Button { prefs.stepText(-1) } label: { Image(systemName: "textformat.size.smaller") }
+                .help("Smaller text (⌘−)").keyboardShortcut("-", modifiers: .command)
+                .disabled(prefs.textScale == Prefs.textScales.first)
+            Button { prefs.stepText(1) } label: { Image(systemName: "textformat.size.larger") }
+                .help("Larger text (⌘+)").keyboardShortcut("=", modifiers: .command)
+                .disabled(prefs.textScale == Prefs.textScales.last)
             if inPopover {
                 Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }.help("Refresh")
                 Button { menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) } label: {
@@ -1509,6 +1521,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add(menu, "Refresh", #selector(refresh), "r")
         menu.addItem(submenu("Menu Bar Shows", menuBarFormats.map { ($0.0, $0.1 as Any, prefs.menuBarFormat == $0.1) }, #selector(setFormat(_:))))
         menu.addItem(submenu("Plan Limit Alert", alertThresholds.map { ($0.0, $0.1 as Any, prefs.alertThreshold == $0.1) }, #selector(setThreshold(_:))))
+        menu.addItem(submenu("Text Size", zip(["Default", "Large", "Larger"], Prefs.textScales).map { ($0.0, $0.1 as Any, prefs.textScale == $0.1) },
+                             #selector(setTextScale(_:))))
         add(menu, "Show on Desktop", #selector(toggleWidget), "", on: prefs.showDesktopWidget)
         add(menu, "Launch at Login", #selector(toggleLogin), "", on: prefs.launchAtLogin)
         add(menu, "Settings…", #selector(openSettings), ",")
@@ -1539,6 +1553,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func setFormat(_ item: NSMenuItem) { if let v = item.representedObject as? String { prefs.menuBarFormat = v } }
     @objc func setThreshold(_ item: NSMenuItem) { if let v = item.representedObject as? Int { prefs.alertThreshold = v } }
     @objc func toggleWidget() { prefs.showDesktopWidget.toggle() }
+    @objc func setTextScale(_ item: NSMenuItem) { if let v = item.representedObject as? CGFloat { prefs.textScale = v } }
     @objc func toggleLogin() { prefs.launchAtLogin.toggle() }
 
     @objc func openSettings() {

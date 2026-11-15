@@ -26,7 +26,7 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 ## Shipped
 
 ### v0.14.0 — text size
-Settings → Text size: Default / Large (new default) / Larger. Fonts, table columns and the panel width (360 → 414 → 468 pt) scale together.
+Text size: Default / Large (new default) / Larger, changed in the panel footer (A− / A+, ⌘− / ⌘+), the right-click menu (Text Size) or Settings. Fonts, table columns and the panel width (360 → 414 → 468 pt) scale together.
 
 ### v0.13.0 — three pages
 The single page had grown to about 1,100 pt, taller than the screen. It is now split into three pages:
