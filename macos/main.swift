@@ -95,9 +95,12 @@ struct Row {
     }
 }
 
-/// Usage of one model in one project during one local hour.
+let thisMac = "This Mac"
+
+/// Usage of one model in one project during one local hour (other devices: one local day).
 struct Entry {
     let hour: Date, day: Date, tool: String, model: String, project: String
+    var device = thisMac
     var row = Row()
     var slots = Set<Int>() // 5-minute slots with at least one call, for active time
     var provider: String { providerOf(model) }
@@ -121,6 +124,10 @@ struct Report {
     var unpriced: Set<String> = []
     var quotas: [Quota] = []
     var updated = Date()
+    var otherDevicesStatus = "" // why other devices are missing, when the import is on
+
+    var devices: [String] { Array(Set(entries.map { $0.device })).sorted { $0 == thisMac ? true : $1 == thisMac ? false : $0 < $1 } }
+    var firstDay: Date? { entries.map { $0.day }.min() }
 
     /// Entries whose hour lies in [from, to).
     func entries(from: Date, to: Date) -> [Entry] { entries.filter { $0.hour >= from && $0.hour < to } }
@@ -166,6 +173,25 @@ final class Scanner {
     private var seenClaude = Set<String>()
     private var prices: [String: [Double]] = [:]
     private let env = ProcessInfo.processInfo.environment
+    private let vibe = VibeImporter()
+
+    /// Other devices' daily buckets as entries, priced with our table when we know the model.
+    func remoteEntries() -> [Entry] {
+        let (buckets, host) = vibe.buckets()
+        return buckets.compactMap { b in
+            guard b.hostname != host, let day = b.day else { return nil }
+            let model = normalizeModel(b.model, prices)
+            let i = b.inputTokens ?? 0, o = (b.outputTokens ?? 0) + (b.reasoningOutputTokens ?? 0), cr = b.cachedInputTokens ?? 0
+            let w5 = b.cacheCreation5mTokens ?? 0, w1 = b.cacheCreation1hTokens ?? 0
+            var r = Row(input: i, output: o, cacheRead: cr, cacheWrite: w5 + w1, cost: b.estimatedCost ?? 0)
+            if let p = prices[model] {
+                r.cost = (i * p[0] + o * p[1] + cr * p[2] + w5 * p[3] + w1 * p[4]) / 1e6
+                r.saved = cr * (p[0] - p[2]) / 1e6
+            }
+            let project = b.project == nil || b.project == "unknown" ? "" : b.project!
+            return Entry(hour: day, day: day, tool: b.source, model: model, project: project, device: b.hostname, row: r)
+        }
+    }
 
     func add(_ st: FileState, _ date: Date, _ tool: String, _ rawModel: String, _ project: String,
              _ i: Double, _ o: Double, _ cr: Double, _ cw: Double, _ cw1h: Double = 0) {
@@ -312,7 +338,7 @@ final class Scanner {
         return Quota(product: "Claude", plan: nil, meters: meters, asOf: asOf)
     }
 
-    func run() -> Report {
+    func run(otherDevices: Bool = false) -> Report {
         let p = loadPrices()
         if p != prices { prices = p; files = [:]; seenClaude = [] } // costs are computed while parsing
         let since = daysAgo(scanDays - 1)
@@ -330,14 +356,123 @@ final class Scanner {
                 }
             }
         }
-        return Report(entries: Array(merged.values), unpriced: unpriced,
-                      quotas: [claudeQuota(), codexQuota()].compactMap { $0 })
+        var report = Report(entries: Array(merged.values), unpriced: unpriced,
+                            quotas: [claudeQuota(), codexQuota()].compactMap { $0 })
+        if otherDevices {
+            report.entries += remoteEntries()
+            report.otherDevicesStatus = vibe.status
+        }
+        return report
+    }
+}
+
+// MARK: - Other devices (optional)
+
+/// Opt-in, read-only: usage of the user's other devices from their own Vibe Usage account (vibecafe.ai),
+/// using the key the Vibe Usage app already stored in ~/.vibe-usage/config.json. Nothing is uploaded.
+/// History older than `recentDays` is fetched once in 30-day chunks and cached on disk; recent days come
+/// from the fresher `days=` query, refetched at most every 15 minutes.
+final class VibeImporter {
+    struct Bucket: Codable {
+        let bucketStart: String, hostname: String, source: String, model: String
+        let project: String?
+        let inputTokens, outputTokens, reasoningOutputTokens, cachedInputTokens: Double?
+        let cacheCreation5mTokens, cacheCreation1hTokens, estimatedCost: Double?
+        var day: Date? { parseDate(bucketStart).map { cal.startOfDay(for: $0) } }
+    }
+    private struct Cache: Codable { var account: String; var historyUntil: String?; var history: [Bucket] }
+    private struct Response: Decodable { let buckets: [Bucket]? }
+
+    private(set) var status = ""
+    private var recent: [Bucket] = []
+    private var lastRecent = Date.distantPast
+    private var cache: Cache?
+    private let recentDays = 8
+    private let cacheURL = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("TokenMeter/vibe-history.json")
+    private let dayFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    struct Config { let url: String, key: String, host: String? }
+    static func config() -> Config? {
+        guard let data = FileManager.default.contents(atPath: NSHomeDirectory() + "/.vibe-usage/config.json"),
+              let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let key = d["apiKey"] as? String, !key.isEmpty else { return nil }
+        return Config(url: d["apiUrl"] as? String ?? "https://vibecafe.ai", key: key, host: d["hostname"] as? String)
+    }
+
+    private func get(_ params: [String: String], _ cfg: Config) -> [Bucket]? {
+        guard var c = URLComponents(string: cfg.url + "/api/usage") else { return nil }
+        c.queryItems = params.merging(["tz": TimeZone.current.identifier]) { a, _ in a }.map { URLQueryItem(name: $0.key, value: $0.value) }
+        var req = URLRequest(url: c.url!, timeoutInterval: 30)
+        req.setValue("Bearer \(cfg.key)", forHTTPHeaderField: "Authorization")
+        req.setValue("TokenMeter", forHTTPHeaderField: "User-Agent")
+        let done = DispatchSemaphore(value: 0)
+        var out: [Bucket]?
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            defer { done.signal() }
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if let err = err { self.status = "Couldn't reach Vibe Usage (\(err.localizedDescription))"; return }
+            guard code == 200, let data = data else {
+                self.status = code == 401 ? "Vibe Usage rejected the key — relink in the Vibe Usage app" : "Vibe Usage answered HTTP \(code)"
+                return
+            }
+            out = (try? JSONDecoder().decode(Response.self, from: data))?.buckets ?? []
+        }.resume()
+        done.wait()
+        return out
+    }
+
+    /// Buckets of every device on the account (callers drop this Mac's own).
+    func buckets() -> (buckets: [Bucket], host: String?) {
+        guard let cfg = VibeImporter.config() else { status = "Vibe Usage isn't linked on this Mac"; return ([], nil) }
+        let account = String(cfg.key.utf8.reduce(UInt64(5381)) { ($0 &* 33) &+ UInt64($1) }, radix: 16)
+        if cache == nil, let d = try? Data(contentsOf: cacheURL), let c = try? JSONDecoder().decode(Cache.self, from: d), c.account == account {
+            cache = c
+        }
+        if cache?.account != account { cache = Cache(account: account, historyUntil: nil, history: []) }
+        let historyEnd = daysAgo(recentDays) // history: days <= historyEnd; recent: later days
+        var start: Date?
+        if let u = cache!.historyUntil, let d = dayFmt.date(from: u) {
+            start = cal.date(byAdding: .day, value: 1, to: d)
+        } else if let all = get(["from": "2015-01-01", "to": dayFmt.string(from: today())], cfg) {
+            start = all.compactMap { $0.day }.min() ?? historyEnd
+        }
+        var changed = false
+        while let s = start, s <= historyEnd {
+            let stop = min(cal.date(byAdding: .day, value: 29, to: s)!, historyEnd)
+            guard let b = get(["from": dayFmt.string(from: s), "to": dayFmt.string(from: stop)], cfg) else { break }
+            cache!.history += b.filter { ($0.day ?? .distantPast) >= s && ($0.day ?? .distantFuture) <= stop }
+            cache!.historyUntil = dayFmt.string(from: stop)
+            start = cal.date(byAdding: .day, value: 1, to: stop)
+            changed = true
+        }
+        if changed, let data = try? JSONEncoder().encode(cache!) {
+            try? FileManager.default.createDirectory(at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: cacheURL)
+        }
+        if Date().timeIntervalSince(lastRecent) > 900, let r = get(["days": "\(recentDays)"], cfg) {
+            recent = r
+            lastRecent = Date()
+            status = ""
+        }
+        let history = cache!.history.filter { ($0.day ?? .distantFuture) <= historyEnd }
+        return (history + recent.filter { ($0.day ?? .distantPast) > historyEnd }, cfg.host)
     }
 }
 
 // MARK: - Formatting
 
-func usd(_ v: Double) -> String { v >= 1000 ? String(format: "$%.0f", v) : String(format: "$%.2f", v) }
+private let groupedInt: NumberFormatter = {
+    let f = NumberFormatter()
+    f.numberStyle = .decimal
+    f.maximumFractionDigits = 0
+    return f
+}()
+func usd(_ v: Double) -> String { v >= 1000 ? "$" + (groupedInt.string(from: NSNumber(value: v)) ?? "\(Int(v))") : String(format: "$%.2f", v) }
 func tok(_ v: Double) -> String {
     v >= 1e9 ? String(format: "%.1fB", v / 1e9) : v >= 1e6 ? String(format: "%.1fM", v / 1e6)
         : v >= 1e3 ? String(format: "%.0fK", v / 1e3) : String(format: "%.0f", v)
@@ -368,6 +503,9 @@ final class Prefs: ObservableObject {
     /// Show the fullest plan limit in the menu bar from this % (0 = off).
     @Published var alertThreshold: Int { didSet { ud.set(alertThreshold, forKey: "alertThreshold"); onChange?() } }
     @Published var showDesktopWidget: Bool { didSet { ud.set(showDesktopWidget, forKey: "showDesktopWidget"); onChange?() } }
+    /// Read-only import of the user's other devices from their Vibe Usage account.
+    @Published var includeOtherDevices: Bool { didSet { ud.set(includeOtherDevices, forKey: "includeOtherDevices"); onDataChange?() } }
+    var onDataChange: (() -> Void)?
     @Published var launchAtLogin: Bool {
         didSet {
             let svc = SMAppService.mainApp
@@ -388,6 +526,7 @@ final class Prefs: ObservableObject {
         menuBarFormat = ud.string(forKey: "menuBarFormat") ?? "cost"
         alertThreshold = ud.object(forKey: "alertThreshold") as? Int ?? 80
         showDesktopWidget = ud.bool(forKey: "showDesktopWidget")
+        includeOtherDevices = ud.bool(forKey: "includeOtherDevices")
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 }
@@ -398,15 +537,16 @@ let alertThresholds = [("Off", 0), ("70%", 70), ("80%", 80), ("90%", 90)]
 // MARK: - Store
 
 enum Preset: String, CaseIterable, Identifiable {
-    case today = "Today", h24 = "24H", week = "7D", month = "30D", quarter = "90D"
+    case today = "Today", h24 = "24H", week = "7D", month = "30D", quarter = "90D", all = "All"
     var id: String { rawValue }
-    var days: Int { [1, 1, 7, 30, 90][Preset.allCases.firstIndex(of: self)!] }
-    var title: String { ["Today", "Last 24 hours", "Last 7 days", "Last 30 days", "Last 90 days"][Preset.allCases.firstIndex(of: self)!] }
+    var days: Int { [1, 1, 7, 30, 90, 0][Preset.allCases.firstIndex(of: self)!] }
+    var title: String { ["Today", "Last 24 hours", "Last 7 days", "Last 30 days", "Last 90 days", "All time"][Preset.allCases.firstIndex(of: self)!] }
 }
 
-/// A time range [from, to); `hourly` ranges chart by hour, others by day.
+/// A time range [from, to), charted by `unit` (.hour, .day or .month).
 struct Span {
-    let from: Date, to: Date, days: Int, title: String, hourly: Bool
+    let from: Date, to: Date, days: Int, title: String, unit: Calendar.Component
+    var hourly: Bool { unit == .hour }
     var previous: (from: Date, to: Date) { (from.addingTimeInterval(-to.timeIntervalSince(from)), from) }
 }
 
@@ -417,6 +557,7 @@ final class Store: ObservableObject {
     @Published var provider: String? // nil = all providers
     @Published var model: String? // nil = all models
     @Published var project: String? // nil = all projects
+    @Published var device: String? // nil = all devices
     @Published var mode = "provider" // breakdown: provider | model | project | day
     @Published var hover: Int? // hovered bar in the trend strip
     @Published var contentHeight: CGFloat = 0 // measured panel content, for the popover's scroll cap
@@ -426,7 +567,7 @@ final class Store: ObservableObject {
 
     func refresh() {
         queue.async {
-            let r = self.scanner.run()
+            let r = self.scanner.run(otherDevices: Prefs.shared.includeOtherDevices)
             DispatchQueue.main.async { self.report = r; self.onUpdate?(r) }
         }
     }
@@ -434,14 +575,18 @@ final class Store: ObservableObject {
     var span: Span {
         if let d = pickedDay {
             return Span(from: d, to: cal.date(byAdding: .day, value: 1, to: d)!, days: 1,
-                        title: d.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day()), hourly: true)
+                        title: d.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day()), unit: .hour)
         }
         switch preset {
-        case .today: return Span(from: today(), to: tomorrow(), days: 1, title: preset.title, hourly: true)
+        case .today: return Span(from: today(), to: tomorrow(), days: 1, title: preset.title, unit: .hour)
         case .h24:
             let next = cal.dateInterval(of: .hour, for: Date())!.end
-            return Span(from: next.addingTimeInterval(-86400), to: next, days: 1, title: preset.title, hourly: true)
-        default: return Span(from: daysAgo(preset.days - 1), to: tomorrow(), days: preset.days, title: preset.title, hourly: false)
+            return Span(from: next.addingTimeInterval(-86400), to: next, days: 1, title: preset.title, unit: .hour)
+        case .all:
+            let first = cal.dateInterval(of: .month, for: report?.firstDay ?? today())!.start
+            let days = (cal.dateComponents([.day], from: first, to: tomorrow()).day ?? 1)
+            return Span(from: first, to: tomorrow(), days: max(days, 1), title: "All time", unit: .month)
+        default: return Span(from: daysAgo(preset.days - 1), to: tomorrow(), days: preset.days, title: preset.title, unit: .day)
         }
     }
 }
@@ -507,7 +652,7 @@ struct WidgetView: View {
     func scoped(_ r: Report, _ from: Date, _ to: Date) -> [Entry] {
         r.entries(from: from, to: to).filter {
             (provider == nil || $0.provider == provider) && (store.model == nil || $0.model == store.model)
-                && (store.project == nil || $0.project == store.project)
+                && (store.project == nil || $0.project == store.project) && (store.device == nil || $0.device == store.device)
         }
     }
     func sum(_ es: [Entry]) -> Row { es.reduce(into: Row()) { $0.add($1.row) } }
@@ -535,6 +680,7 @@ struct WidgetView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
             if let r = store.report {
+                if r.devices.count > 1 { devicesRow(r) }
                 filters(r)
                 if !r.quotas.isEmpty { quotas(r) }
                 hero(r)
@@ -558,10 +704,11 @@ struct WidgetView: View {
     // MARK: header & filters
 
     var header: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 6) {
+        HStack(spacing: 7) {
+            HStack(spacing: 5) {
                 Image(systemName: "chart.bar.fill").foregroundColor(accent)
-                Text("TOKENMETER").font(.system(size: 12, weight: .semibold).width(.expanded)).tracking(1.2)
+                Text("TOKENMETER").font(.system(size: 11, weight: .semibold).width(.expanded)).tracking(0.8)
+                    .fixedSize()
             }
             .contentShape(Rectangle())
             .overlay(inPopover ? nil : DragHandle(menu: menu)) // desktop: drag to move, right-click for menu
@@ -572,10 +719,27 @@ struct WidgetView: View {
         }
     }
 
+    /// Shown once other devices are imported: all devices, this Mac, or one device picked in the breakdown.
+    func devicesRow(_ r: Report) -> some View {
+        HStack(spacing: 10) {
+            cap("Devices")
+            tab("All \(r.devices.count)", store.device == nil) { store.device = nil }
+            tab(thisMac, store.device == thisMac) { store.device = thisMac }
+            if let d = store.device, d != thisMac {
+                tab("\(d) ✕", true) { store.device = nil }.help("Click to show all devices")
+            }
+            Spacer()
+        }
+    }
+
     func filters(_ r: Report) -> some View {
         HStack(spacing: 6) {
-            chip("All", nil, .primary)
-            ForEach(present, id: \.name) { chip($0.name, $0.name, $0.color) }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    chip("All", nil, .primary)
+                    ForEach(present, id: \.name) { chip($0.name, $0.name, $0.color) }
+                }
+            }
             if let p = store.project {
                 Button { store.project = nil } label: {
                     HStack(spacing: 4) {
@@ -600,7 +764,7 @@ struct WidgetView: View {
         return Button { store.provider = value; store.model = nil } label: {
             HStack(spacing: 5) {
                 if value != nil { Circle().fill(color).frame(width: 6, height: 6) }
-                Text(label)
+                Text(label).fixedSize()
             }
             .font(.system(size: 11, weight: .medium))
             .padding(.horizontal, 9).padding(.vertical, 4)
@@ -675,7 +839,8 @@ struct WidgetView: View {
         let g = store.span
         let es = scoped(r, g.from, g.to)
         let cur = sum(es)
-        let prev = sum(scoped(r, g.previous.from, g.previous.to))
+        let prev = store.preset == .all && pickedDay == nil ? Row() : sum(scoped(r, g.previous.from, g.previous.to))
+        let remote = es.contains { $0.device != thisMac }
         let inputSide = cur.input + cur.cacheRead + cur.cacheWrite
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -696,10 +861,14 @@ struct WidgetView: View {
                 }
             }
             Text(insight(es, cur, g.days)).font(.system(size: 12)).foregroundColor(.primary.opacity(0.85))
-            Text("\(tok(cur.tokens)) tokens · \(Int(cur.calls)) calls · \(duration(activeSeconds(es))) active")
+            Text("\(tok(cur.tokens)) tokens · \(Int(cur.calls)) calls · \(duration(activeSeconds(es))) active\(remote ? " on this Mac" : "")")
                 .font(.system(size: 10.5)).foregroundColor(.secondary).monospacedDigit()
                 .help("Active time: 5-minute slots with at least one model call")
             trend(r, g)
+            if remote && g.hourly {
+                Text("Other devices report daily totals; they appear in the first hour.")
+                    .font(.system(size: 9.5)).foregroundColor(.secondary)
+            }
             Divider().opacity(0.6)
             HStack(alignment: .top, spacing: 10) {
                 mix("Input", cur.input, cur.tokens)
@@ -734,26 +903,28 @@ struct WidgetView: View {
 
     /// Bars by hour (Today, 24H, a picked day) or by day; hover for values, click a day to focus it.
     func trend(_ r: Report, _ g: Span) -> some View {
-        let n = g.hourly ? 24 : g.days
+        let n = g.hourly ? 24 : g.unit == .month ? (cal.dateComponents([.month], from: g.from, to: today()).month ?? 0) + 1 : g.days
         let start: (Int) -> Date = { i in
-            g.hourly ? g.from.addingTimeInterval(Double(i) * 3600) : cal.date(byAdding: .day, value: i, to: g.from)!
+            g.hourly ? g.from.addingTimeInterval(Double(i) * 3600) : cal.date(byAdding: g.unit, value: i, to: g.from)!
         }
         var slots = Array(repeating: Row(), count: n)
         for e in scoped(r, g.from, g.to) {
             let i = g.hourly ? Int(e.hour.timeIntervalSince(g.from) / 3600)
-                : cal.dateComponents([.day], from: g.from, to: e.day).day ?? -1
+                : cal.dateComponents([g.unit], from: g.from, to: e.day).value(for: g.unit) ?? -1
             if i >= 0 && i < n { slots[i].add(e.row) }
         }
         let maxV = slots.map { $0.cost }.max() ?? 0
         let hi = store.hover.flatMap { $0 < n ? $0 : nil }
-        let label: (Int) -> String = { i in g.hourly ? hourLabel(start(i)) : dayLabel(start(i)) }
+        let label: (Int) -> String = { i in
+            g.hourly ? hourLabel(start(i)) : g.unit == .month ? start(i).formatted(.dateTime.month(.abbreviated).year(.twoDigits)) : dayLabel(start(i))
+        }
         let peak = slots.indices.max { slots[$0].cost < slots[$1].cost }
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
                 if let i = hi {
                     cap("\(label(i)) · \(usd(slots[i].cost)) · \(tok(slots[i].tokens))")
                 } else {
-                    cap(g.hourly ? "By hour" : "By day")
+                    cap(g.hourly ? "By hour" : g.unit == .month ? "By month" : "By day")
                     Spacer()
                     if let p = peak, maxV > 0 { cap("Peak \(usd(maxV)) · \(label(p))") }
                 }
@@ -778,7 +949,7 @@ struct WidgetView: View {
                     }
                 }
                 .onTapGesture { loc in
-                    guard !g.hourly else { return }
+                    guard g.unit == .day else { return }
                     let i = min(n - 1, max(0, Int(loc.x / geo.size.width * CGFloat(n))))
                     store.pickedDay = start(i)
                 }
@@ -885,6 +1056,7 @@ struct WidgetView: View {
                 tab("Provider", store.mode == "provider") { store.mode = "provider" }
                 tab("Model", store.mode == "model") { store.mode = "model" }
                 tab("Project", store.mode == "project") { store.mode = "project" }
+                if r.devices.count > 1 { tab("Device", store.mode == "device") { store.mode = "device" } }
                 tab("Day", store.mode == "day") { store.mode = "day" }
                 Spacer()
             }
@@ -893,20 +1065,23 @@ struct WidgetView: View {
             } else if store.mode == "day" {
                 days(r, g)
             } else {
-                let byProvider = store.mode == "provider", byProject = store.mode == "project"
-                let groups = Dictionary(grouping: es, by: { byProvider ? $0.provider : byProject ? ($0.project.isEmpty ? "?" : $0.project) : $0.model })
+                let byProvider = store.mode == "provider", byProject = store.mode == "project", byDevice = store.mode == "device"
+                let groups = Dictionary(grouping: es, by: {
+                    byProvider ? $0.provider : byProject ? ($0.project.isEmpty ? "?" : $0.project) : byDevice ? $0.device : $0.model
+                })
                     .map { (key: $0.key, es: $0.value, row: sum($0.value)) }
                     .sorted { $0.row.cost > $1.row.cost }
                 ForEach(Array(groups.prefix(8)), id: \.key) { grp in
                     Button {
                         if byProvider { store.provider = grp.key; store.model = nil }
                         else if byProject { store.project = grp.key == "?" ? nil : grp.key }
+                        else if byDevice { store.device = grp.key }
                         else { store.model = grp.key }
                     } label: {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 6) {
-                                if byProject {
-                                    Image(systemName: "folder").font(.system(size: 9)).foregroundColor(.secondary)
+                                if byProject || byDevice {
+                                    Image(systemName: byDevice ? "desktopcomputer" : "folder").font(.system(size: 9)).foregroundColor(.secondary)
                                 } else {
                                     Circle().fill(providerColor(byProvider ? grp.key : providerOf(grp.key)))
                                         .frame(width: 6, height: 6)
@@ -922,7 +1097,7 @@ struct WidgetView: View {
                             }
                             .monospacedDigit()
                             bar(cur.cost > 0 ? grp.row.cost / cur.cost : 0)
-                            if byProvider { Text(modelSplit(grp.es)).font(.system(size: 10)).foregroundColor(.secondary).lineLimit(2) }
+                            if byProvider || byDevice { Text(modelSplit(grp.es)).font(.system(size: 10)).foregroundColor(.secondary).lineLimit(2) }
                         }
                         .contentShape(Rectangle())
                     }
@@ -948,21 +1123,24 @@ struct WidgetView: View {
     }
 
     /// Daily table for the selected range, newest first; click a row to focus that day.
+    /// Long ranges list only days with usage.
     func days(_ r: Report, _ g: Span) -> some View {
+        let byDay = Dictionary(grouping: scoped(r, g.from, g.to), by: { $0.day }).mapValues { sum($0) }
         let first = cal.startOfDay(for: g.from), last = cal.startOfDay(for: g.to.addingTimeInterval(-1))
         let count = (cal.dateComponents([.day], from: first, to: last).day ?? 0) + 1
-        let rows = (0..<count).map { cal.date(byAdding: .day, value: -$0, to: last)! }.map { d in
-            (day: d, row: sum(scoped(r, max(d, g.from), min(cal.date(byAdding: .day, value: 1, to: d)!, g.to))))
-        }
+        let rows = (0..<count).map { cal.date(byAdding: .day, value: -$0, to: last)! }
+            .map { (day: $0, row: byDay[$0] ?? Row()) }
+            .filter { g.days <= 90 || $0.row.tokens > 0 }
         return VStack(spacing: 0) {
             HStack { cap("Date"); Spacer(); cap("Tokens").frame(width: 70, alignment: .trailing); cap("Cost").frame(width: 64, alignment: .trailing) }
                 .padding(.bottom, 6)
             ScrollView {
-                VStack(spacing: 0) {
+                LazyVStack(spacing: 0) {
                     ForEach(rows, id: \.day) { x in
                         Button { store.pickedDay = x.day } label: {
                             HStack {
-                                Text(x.day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day()))
+                                Text(g.unit == .month ? x.day.formatted(.dateTime.month(.abbreviated).day().year(.twoDigits))
+                                     : x.day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day()))
                                 Spacer()
                                 Text(x.row.tokens > 0 ? tok(x.row.tokens) : "—").foregroundColor(.secondary)
                                     .frame(width: 70, alignment: .trailing)
@@ -985,7 +1163,12 @@ struct WidgetView: View {
     var footer: some View {
         HStack(spacing: 6) {
             if let r = store.report {
-                cap("Synced \(r.updated.formatted(date: .omitted, time: .shortened)) · local only")
+                if !r.otherDevicesStatus.isEmpty {
+                    Label(r.otherDevicesStatus, systemImage: "exclamationmark.triangle").foregroundColor(.orange).lineLimit(1)
+                        .help(r.otherDevicesStatus)
+                } else {
+                    cap("Synced \(r.updated.formatted(date: .omitted, time: .shortened)) · \(r.devices.count > 1 ? "\(r.devices.count) devices" : "local only")")
+                }
             }
             Spacer()
             cap("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")")
@@ -1022,13 +1205,21 @@ struct SettingsView: View {
                 Toggle("Launch at login", isOn: $prefs.launchAtLogin)
                 Toggle("Show widget on desktop", isOn: $prefs.showDesktopWidget)
             }
+            Section("Other devices") {
+                Toggle("Include my other devices from Vibe Usage", isOn: $prefs.includeOtherDevices)
+                    .disabled(VibeImporter.config() == nil && !prefs.includeOtherDevices)
+                Text(VibeImporter.config() == nil
+                     ? "Link the Vibe Usage app on this Mac first. TokenMeter then reads your account's history with the key it stored."
+                     : "Read-only: downloads your account's usage from vibecafe.ai with the key the Vibe Usage app stored on this Mac, back to your first synced day. Nothing is uploaded. This Mac's numbers always come from its own logs.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
             Section("Pricing") {
                 Text("Costs are estimated at API list prices. Override or add models in ~/.config/tokenmeter/prices.json (USD per 1M tokens: input, output, cache read, cache write 5m, cache write 1h). The CLI reads the same file.")
                     .font(.caption).foregroundColor(.secondary)
                 Button("Edit Prices…") { openPricesFile() }
             }
             Section("About") {
-                Text("TokenMeter \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev") reads the logs Claude Code and Codex write on this Mac. Nothing is uploaded.")
+                Text("TokenMeter \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev") reads the logs Claude Code and Codex write on this Mac. Nothing is uploaded; the only network request is the optional other-devices download.")
                     .font(.caption).foregroundColor(.secondary)
             }
         }
@@ -1096,6 +1287,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.snapshotIfRequested()
         }
         prefs.onChange = { [weak self] in self?.applyPrefs() }
+        prefs.onDataChange = { [weak self] in
+            if self?.prefs.includeOtherDevices == false { self?.store.device = nil }
+            self?.store.refresh()
+        }
         // Any data or selection change can change the content height.
         sizeSub = store.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.fit() }
@@ -1172,13 +1367,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count else { return }
         let mode = i + 2 < args.count ? args[i + 2] : "today"
         if mode.hasPrefix("day"), let n = Int(mode.dropFirst(3)) { store.pickedDay = daysAgo(n) }
-        else { store.preset = ["24h": .h24, "week": .week, "month": .month, "90d": .quarter][mode] ?? .today }
+        else { store.preset = ["24h": .h24, "week": .week, "month": .month, "90d": .quarter, "all": .all][mode] ?? .today }
         let arg: (String) -> String? = { k in args.first { $0.hasPrefix(k + "=") }.map { String($0.dropFirst(k.count + 1)) } }
         if let v = arg("provider") { store.provider = v }
         if let v = arg("model") { store.model = v }
         if let v = arg("mode") { store.mode = v }
         if let v = arg("project") { store.project = v }
         if let v = arg("hover") { store.hover = Int(v) }
+        if let v = arg("device") { store.device = v }
         window.contentView?.layer?.backgroundColor = NSColor(white: 0.13, alpha: 1).cgColor
         if let blur = window.contentView, args.contains("--popover") || args.contains("--settings") {
             hosting.removeFromSuperview()

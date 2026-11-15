@@ -25,6 +25,21 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.12.0 — other devices and all-time history
+- **Optional other-devices import (off by default).**
+  - Uses the key the Vibe Usage app stored in `~/.vibe-usage/config.json` and reads `/api/usage` from vibecafe.ai. Read-only.
+  - History older than 8 days is fetched once in 30-day `from/to` chunks and cached in `~/Library/Caches/TokenMeter/vibe-history.json`. The cache is keyed by a hash of the account key.
+  - The last 8 days come from `days=8`, refreshed at most every 15 minutes. The `from/to` rollups lag on the newest day; the `days=` query is current.
+  - This Mac's own buckets are dropped, because its local logs are authoritative.
+  - Other devices are priced with our table when the model is known, otherwise with the server's estimate.
+- **Devices.** Devices row (All / This Mac / one device), a Device tab in the breakdown, and a status line when the import fails.
+- **All range.** Monthly bars and no previous-period delta.
+  - Day table lists only days with usage for ranges over 90 days.
+  - Hourly views note that other devices report daily totals.
+  - Calls and active time are labeled "on this Mac".
+- **Formatting.** Thousands separators in dollar amounts, and a horizontally scrolling provider row.
+- **Retention.** README documents `cleanupPeriodDays: 3650` so Claude Code stops deleting logs after 30 days.
+
 ### v0.11.0 — analysis depth and settings (P1 complete, P2 mostly complete)
 - **Ranges.** Today / 24H (rolling, distinct from Today) / 7D / 30D / 90D. Data is now kept per local hour, and the scan window grew to 182 days so 90D has a previous period to compare against.
 - **Trend strip.** Bars under the headline number:
@@ -79,6 +94,7 @@ CLI, pricing, macOS app, menu bar popover, provider + model filters.
 - Budget alerts: a daily or monthly spending limit with a system notification.
 - Per-project budgets and a "this week vs last week" digest notification.
 - Export a range to CSV from the Day tab.
+- CLI: `--devices` using the same Vibe Usage import.
 - Intel test run. The universal binary builds, but it has only been run on Apple silicon.
 
 ### Engineering notes
