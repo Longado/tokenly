@@ -1,4 +1,4 @@
-// TokenMeter.app: desktop widget + menu bar item showing local token usage and
+// TokenMeter.app: menu bar panel (and optional desktop widget) showing local token usage and
 // API-equivalent cost for Claude Code and Codex CLI. Reads local logs only.
 import AppKit
 import Combine
@@ -20,11 +20,21 @@ let prices: [String: [Double]] = [
     "gpt-6.1-sol": [2, 10, 0.10, 2.5, 2.5],
 ]
 
-let tools: [(name: String, color: Color)] = [
-    ("Claude Code", Color(red: 0.85, green: 0.47, blue: 0.34)),
-    ("Codex", Color(red: 0.40, green: 0.62, blue: 1.0)),
+// Billing provider, derived from the model name; the tool (Claude Code, Codex) is just the log source.
+let providers: [(name: String, color: Color)] = [
+    ("Anthropic", Color(red: 0.85, green: 0.47, blue: 0.34)),
+    ("OpenAI", Color(red: 0.33, green: 0.72, blue: 0.60)),
+    ("Google", Color(red: 0.40, green: 0.62, blue: 1.0)),
+    ("Other", Color.gray),
 ]
-func toolColor(_ t: String) -> Color { tools.first { $0.name == t }?.color ?? .gray }
+func providerOf(_ model: String) -> String {
+    let m = model.lowercased()
+    if m.hasPrefix("claude") { return "Anthropic" }
+    if m.hasPrefix("gpt") || m.hasPrefix("codex") || m.range(of: #"^o\d"#, options: .regularExpression) != nil { return "OpenAI" }
+    if m.hasPrefix("gemini") { return "Google" }
+    return "Other"
+}
+func providerColor(_ p: String) -> Color { providers.first { $0.name == p }?.color ?? .gray }
 
 // MARK: - Data
 
@@ -41,6 +51,7 @@ struct Row {
 struct Entry {
     let day: Date, tool: String, model: String
     var row: Row
+    var provider: String { providerOf(model) }
 }
 
 struct Report {
@@ -158,7 +169,7 @@ final class Store: ObservableObject {
     @Published var report: Report?
     @Published var preset = Preset.today
     @Published var pickedDay: Date?
-    @Published var tool: String? // nil = all tools
+    @Published var provider: String? // nil = all providers
     @Published var model: String? // nil = all models
     var onUpdate: ((Report) -> Void)?
     func refresh() {
@@ -184,7 +195,7 @@ struct WidgetView: View {
     var inPopover = false
 
     var pickedDay: Date? { store.pickedDay }
-    var tool: String? { store.tool }
+    var provider: String? { store.provider }
 
     /// Selected range: a clicked day, or the preset ending today.
     var range: (from: Date, to: Date, days: Int, title: String) {
@@ -192,16 +203,21 @@ struct WidgetView: View {
         return (daysAgo(store.preset.days - 1), today(), store.preset.days, store.preset.title)
     }
 
-    /// Entries in [from, to] for the selected tool (all tools when nil).
+    /// Entries in [from, to] for the selected provider/model (all when nil).
     func scoped(_ r: Report, _ from: Date, _ to: Date) -> [Entry] {
-        r.entries(from: from, to: to).filter { (tool == nil || $0.tool == tool) && (store.model == nil || $0.model == store.model) }
+        r.entries(from: from, to: to).filter { (provider == nil || $0.provider == provider) && (store.model == nil || $0.model == store.model) }
     }
     func sum(_ es: [Entry]) -> Row { es.reduce(into: Row()) { $0.add($1.row) } }
+    /// Providers that have any usage in the scan window, in fixed order.
+    var present: [(name: String, color: Color)] {
+        let seen = Set(store.report?.entries.map { $0.provider } ?? [])
+        return providers.filter { seen.contains($0.name) }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
-            toolChips
+            providerChips
             if let r = store.report {
                 hero(r)
                 chart(r)
@@ -225,7 +241,7 @@ struct WidgetView: View {
     var header: some View {
         HStack(spacing: 8) {
             HStack(spacing: 6) {
-                Image(systemName: "chart.bar.fill").foregroundColor(tool.map(toolColor) ?? .accentColor)
+                Image(systemName: "chart.bar.fill").foregroundColor(provider.map(providerColor) ?? .accentColor)
                 Text("TokenMeter").font(.system(size: 13, weight: .semibold))
             }
             .contentShape(Rectangle())
@@ -239,17 +255,17 @@ struct WidgetView: View {
         }
     }
 
-    var toolChips: some View {
+    var providerChips: some View {
         HStack(spacing: 6) {
             chip("All", nil, .primary)
-            ForEach(tools, id: \.name) { chip($0.name, $0.name, $0.color) }
+            ForEach(present, id: \.name) { chip($0.name, $0.name, $0.color) }
             Spacer()
         }
     }
 
     func chip(_ label: String, _ value: String?, _ color: Color) -> some View {
-        let on = store.tool == value
-        return Button { store.tool = value; store.model = nil } label: {
+        let on = store.provider == value
+        return Button { store.provider = value; store.model = nil } label: {
             HStack(spacing: 5) {
                 if value != nil { Circle().fill(color).frame(width: 6, height: 6) }
                 Text(label)
@@ -304,7 +320,7 @@ struct WidgetView: View {
         return Chart {
             ForEach(Array(data.enumerated()), id: \.offset) { _, e in
                 BarMark(x: .value("Day", e.day, unit: .day), y: .value("Cost", e.row.cost))
-                    .foregroundStyle(by: .value("Tool", e.tool))
+                    .foregroundStyle(by: .value("Provider", e.provider))
                     .cornerRadius(2.5)
                     .opacity(e.day >= g.from && e.day <= g.to ? 1 : 0.3)
             }
@@ -314,7 +330,7 @@ struct WidgetView: View {
                     .foregroundStyle(Color.secondary)
             }
         }
-        .chartForegroundStyleScale(domain: tools.map { $0.name }, range: tools.map { $0.color })
+        .chartForegroundStyleScale(domain: providers.map { $0.name }, range: providers.map { $0.color })
         .chartXScale(domain: from ... cal.date(byAdding: .day, value: 1, to: today())!)
         .chartXAxis {
             AxisMarks(values: .stride(by: .day, count: 7)) { _ in
@@ -381,21 +397,21 @@ struct WidgetView: View {
         if store.model != nil {
             // One model: what its tokens are made of.
             title = "TOKEN MIX"
-            let c = toolColor(es.first?.tool ?? tool ?? "")
+            let c = providerColor(es.first?.provider ?? provider ?? "")
             items = [("Input", cur.input), ("Output", cur.output), ("Cache read", cur.cacheRead), ("Cache write", cur.cacheWrite)]
                 .map { p in (p.0, c, cur.tokens > 0 ? p.1 / cur.tokens : 0, tok(p.1), {}) }
-        } else if let t = tool {
+        } else if let p = provider {
             title = "BY MODEL"
             items = Dictionary(grouping: es, by: { $0.model }).map { kv in
                 let row = sum(kv.value)
-                return (kv.key, toolColor(t), cur.cost > 0 ? row.cost / cur.cost : 0,
+                return (kv.key, providerColor(p), cur.cost > 0 ? row.cost / cur.cost : 0,
                         r.unpriced.contains(kv.key) ? "—" : usd(row.cost), { store.model = kv.key })
             }.sorted { $0.value > $1.value }
         } else {
-            title = "BY TOOL"
-            items = tools.map { t in
-                let row = sum(es.filter { $0.tool == t.name })
-                return (t.name, t.color, cur.cost > 0 ? row.cost / cur.cost : 0, usd(row.cost), { store.tool = t.name })
+            title = "BY PROVIDER"
+            items = present.map { p in
+                let row = sum(es.filter { $0.provider == p.name })
+                return (p.name, p.color, cur.cost > 0 ? row.cost / cur.cost : 0, usd(row.cost), { store.provider = p.name })
             }
         }
         return VStack(alignment: .leading, spacing: 10) {
@@ -411,7 +427,7 @@ struct WidgetView: View {
                 Button(action: item.select) {
                     VStack(spacing: 5) {
                         HStack(spacing: 6) {
-                            if title == "BY TOOL" { Circle().fill(item.color).frame(width: 7, height: 7) }
+                            if title == "BY PROVIDER" { Circle().fill(item.color).frame(width: 7, height: 7) }
                             Text(item.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
                             Spacer()
                             Text(String(format: "%.0f%%", item.value * 100))
@@ -435,15 +451,19 @@ struct WidgetView: View {
         }
     }
 
-    /// Dropdown of every model seen for the current tool; picking one filters the whole panel.
+    /// Dropdown of models grouped by provider; picking one filters the whole panel.
     func modelPicker(_ r: Report) -> some View {
-        let models = Dictionary(grouping: r.entries.filter { tool == nil || $0.tool == tool }, by: { $0.model })
-            .mapValues { $0.reduce(0) { $0 + $1.row.cost } }
-            .sorted { $0.value > $1.value }.map { $0.key }
+        let cost = Dictionary(grouping: r.entries, by: { $0.model }).mapValues { $0.reduce(0) { $0 + $1.row.cost } }
+        let groups = present.filter { provider == nil || $0.name == provider }.map { p in
+            (p.name, cost.keys.filter { providerOf($0) == p.name }.sorted { cost[$0]! > cost[$1]! })
+        }
         return Picker("", selection: Binding(get: { store.model }, set: { store.model = $0 })) {
             Text("All models").tag(String?.none)
-            Divider()
-            ForEach(models, id: \.self) { Text($0).tag(String?.some($0)) }
+            ForEach(groups, id: \.0) { g in
+                Section(g.0) {
+                    ForEach(g.1, id: \.self) { Text($0).tag(String?.some($0)) }
+                }
+            }
         }
         .pickerStyle(.menu).labelsHidden().controlSize(.small).fixedSize()
     }
@@ -569,7 +589,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mode = i + 2 < args.count ? args[i + 2] : "today"
         if mode.hasPrefix("day"), let n = Int(mode.dropFirst(3)) { store.pickedDay = daysAgo(n) }
         else { store.preset = mode == "week" ? .week : mode == "month" ? .month : .today }
-        if let t = args.first(where: { $0.hasPrefix("tool=") }) { store.tool = String(t.dropFirst(5)) }
+        if let t = args.first(where: { $0.hasPrefix("provider=") }) { store.provider = String(t.dropFirst(9)) }
         if let m = args.first(where: { $0.hasPrefix("model=") }) { store.model = String(m.dropFirst(6)) }
         window.contentView?.layer?.backgroundColor = NSColor(white: 0.13, alpha: 1).cgColor
         if args.contains("--popover"), let blur = window.contentView {
