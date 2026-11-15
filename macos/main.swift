@@ -1011,14 +1011,23 @@ struct WidgetView: View {
         .card()
     }
 
-    /// Overview page: the running totals, one line.
+    /// Overview page: three numbers about the selected period.
     func totals(_ r: Report) -> some View {
-        let c7 = sum(scoped(r, daysAgo(6), tomorrow())).cost
-        let c30 = sum(scoped(r, daysAgo(29), tomorrow())).cost
+        let g = store.span
+        let es = scoped(r, g.from, g.to)
+        let cur = sum(es)
+        let hourly = g.hourly
+        let buckets = Dictionary(grouping: es, by: { hourly ? $0.hour : $0.day }).mapValues { sum($0).cost }
+        let busiest = buckets.max { $0.value < $1.value }
         return HStack(spacing: 0) {
-            stat("Today", usd(sum(scoped(r, today(), tomorrow())).cost))
-            stat("Last 7 days", usd(c7))
-            stat("Last 30 days", usd(c30))
+            if hourly {
+                stat("Active hours", "\(buckets.filter { $0.value > 0 }.count)/\(g.unit == .hour ? 24 : 24)")
+                stat("Busiest hour", busiest.map { usd($0.value) } ?? "—", busiest.map { hourLabel($0.key) })
+            } else {
+                stat("Active days", "\(buckets.filter { $0.value > 0 }.count)/\(g.days)")
+                stat("Busiest day", busiest.map { usd($0.value) } ?? "—", busiest.map { dayLabel($0.key) })
+            }
+            stat("Cache saved", usd(cur.saved))
         }
         .card()
     }
@@ -1213,10 +1222,12 @@ struct WidgetView: View {
         .onTapGesture { if day <= today() { store.pickedDay = pickedDay == day ? nil : day } }
     }
 
-    func stat(_ label: String, _ value: String) -> some View {
+    func stat(_ label: String, _ value: String, _ sub: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             cap(label)
             Text(value).font(.system(size: fs(15), weight: .regular).width(.expanded)).monospacedDigit()
+                .lineLimit(1).minimumScaleFactor(0.7)
+            if let sub = sub { Text(sub).font(.system(size: fs(9.5))).foregroundColor(.secondary) }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

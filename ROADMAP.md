@@ -25,6 +25,9 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.16.1 — bottom card follows the period
+The Overview bottom card showed fixed Today / 7-day / 30-day totals, which ignored the selected period. It now shows numbers for the selected period: active days (or active hours for single-day views), busiest day (or hour) with its date, and cache savings.
+
 ### v0.16.0 — more lessons from Vibe Usage
 - **Plan-limit pace.** A thin second bar under each limit shows how much of the window has passed. A pace line projects usage at reset ("on pace for 124% — may run out", orange from 100%, red from 120%). Window lengths: Claude 5h / 7d; Codex `window_minutes`.
 - **Chart metric switch.** `$ / Tok / Time` on the trend strip; the activity calendar follows it. Time is active time, this Mac only. Hover shows cost, tokens and active time.
