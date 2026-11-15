@@ -178,6 +178,7 @@ enum Preset: String, CaseIterable, Identifiable {
 struct WidgetView: View {
     @ObservedObject var store: Store
     let menu: NSMenu
+    var inPopover = false
     var preset: Preset { store.preset }
     var pickedDay: Date? { store.pickedDay }
 
@@ -215,11 +216,27 @@ struct WidgetView: View {
         HStack {
             Text("TokenMeter").fontWeight(.semibold)
             Spacer()
-            if let r = store.report { Text("Updated \(r.updated.formatted(date: .omitted, time: .shortened))") }
+            if let r = store.report {
+                Text("Updated \(r.updated.formatted(date: .omitted, time: .shortened))")
+                    .padding(.trailing, inPopover ? 44 : 0)
+            }
         }
         .font(.caption).foregroundColor(.secondary)
         .contentShape(Rectangle())
-        .overlay(DragHandle(menu: menu)) // drag to move, right-click for menu
+        .overlay(inPopover ? nil : DragHandle(menu: menu)) // drag to move, right-click for menu
+        .overlay(alignment: .trailing) {
+            if inPopover {
+                HStack(spacing: 2) {
+                    Spacer()
+                    Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }
+                    Button { menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                }
+                .buttonStyle(.borderless)
+                .background(Color.clear)
+            }
+        }
     }
 
     func summary(_ r: Report) -> some View {
@@ -312,7 +329,7 @@ struct WidgetView: View {
                     .font(.callout)
                     GeometryReader { geo in
                         ZStack(alignment: .leading) {
-                            Capsule().fill(Color.white.opacity(0.1))
+                            Capsule().fill(Color.primary.opacity(0.1))
                             Capsule().fill(t.color)
                                 .frame(width: geo.size.width * (total > 0 ? row.cost / total : 0))
                         }
@@ -366,6 +383,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var window: NSWindow!
     var statusItem: NSStatusItem!
     var hosting: NSView!
+    let popover = NSPopover()
     var sizeSub: AnyCancellable?
     let menu = NSMenu()
 
@@ -374,7 +392,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildWindow()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "TM"
-        statusItem.menu = menu
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(statusClicked)
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        let hc = NSHostingController(rootView: WidgetView(store: store, menu: menu, inPopover: true))
+        hc.sizingOptions = .preferredContentSize
+        popover.contentViewController = hc
+        popover.behavior = .transient
         store.onUpdate = { [weak self] r in
             self?.statusItem.button?.title = usd(r.total(from: today(), to: today()).cost)
             self?.snapshotIfRequested()
@@ -418,10 +442,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window.setFrameTopLeftPoint(NSPoint(x: screen.maxX - 380, y: screen.maxY - 40))
         }
         window.setFrameAutosaveName(name)
-        if !UserDefaults.standard.bool(forKey: "hidden") { window.orderFront(nil) }
+        if UserDefaults.standard.bool(forKey: "showDesktopWidget") || CommandLine.arguments.contains("--snapshot") {
+            window.orderFront(nil)
+        }
     }
 
-    /// Debug: `TokenMeter --snapshot out.png [today|week|month|dayN]` renders the widget to a PNG and quits.
+    /// Debug: `TokenMeter --snapshot out.png [today|week|month|dayN] [--popover]` renders the widget to a PNG and quits.
     func snapshotIfRequested() {
         let args = CommandLine.arguments
         guard let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count else { return }
@@ -429,6 +455,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if mode.hasPrefix("day"), let n = Int(mode.dropFirst(3)) { store.pickedDay = daysAgo(n) }
         else { store.preset = mode == "week" ? .week : mode == "month" ? .month : .today }
         window.contentView?.layer?.backgroundColor = NSColor(white: 0.13, alpha: 1).cgColor
+        if args.contains("--popover"), let blur = window.contentView {
+            hosting.removeFromSuperview()
+            hosting = ClickThroughHostingView(rootView: WidgetView(store: store, menu: menu, inPopover: true))
+            hosting.frame = blur.bounds
+            hosting.autoresizingMask = [.width, .height]
+            blur.addSubview(hosting)
+            fit()
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             guard let v = self.window.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { exit(1) }
             v.cacheDisplay(in: v.bounds, to: rep)
@@ -455,7 +489,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
         }
         add(menu, "Refresh", #selector(refresh), "r")
-        add(menu, "Show Widget", #selector(toggleWidget), "", on: window.isVisible)
+        add(menu, "Show on Desktop", #selector(toggleWidget), "", on: window.isVisible)
         add(menu, "Launch at Login", #selector(toggleLogin), "", on: SMAppService.mainApp.status == .enabled)
         menu.addItem(.separator())
         add(menu, "Quit TokenMeter", #selector(NSApplication.terminate(_:)), "q")
@@ -469,9 +503,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func refresh() { store.refresh() }
 
+    /// Left click: usage panel. Right click: menu.
+    @objc func statusClicked() {
+        guard let button = statusItem.button else { return }
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            statusItem.menu = menu
+            button.performClick(nil)
+            statusItem.menu = nil
+        } else if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            if let r = store.report, Date().timeIntervalSince(r.updated) > 60 { store.refresh() }
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
     @objc func toggleWidget() {
         if window.isVisible { window.orderOut(nil) } else { window.orderFront(nil) }
-        UserDefaults.standard.set(!window.isVisible, forKey: "hidden")
+        UserDefaults.standard.set(window.isVisible, forKey: "showDesktopWidget")
     }
 
     @objc func toggleLogin() {
