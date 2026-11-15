@@ -25,6 +25,14 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.13.0 — three pages
+The single page had grown to about 1,100 pt, taller than the screen. It is now split into three pages:
+- **Overview** answers "am I OK right now?": headline cost and trend, plan limits, and today / 7-day / 30-day totals. About 550 pt tall.
+- **Breakdown** holds the analysis: provider, model and project filters, token mix with cache savings, and the provider / model / project / device / day breakdown.
+- **History** shows the 13-week calendar and every month on record, with a monthly table.
+
+Range (Today … All time) and device pickers moved to one row under the header and apply to every page. Duplicated totals were removed.
+
 ### v0.12.0 — other devices and all-time history
 - **Optional other-devices import (off by default).**
   - Uses the key the Vibe Usage app stored in `~/.vibe-usage/config.json` and reads `/api/usage` from vibecafe.ai. Read-only.

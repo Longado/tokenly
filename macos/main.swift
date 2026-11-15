@@ -558,6 +558,7 @@ final class Store: ObservableObject {
     @Published var model: String? // nil = all models
     @Published var project: String? // nil = all projects
     @Published var device: String? // nil = all devices
+    @Published var page = "overview" // overview | breakdown | history
     @Published var mode = "provider" // breakdown: provider | model | project | day
     @Published var hover: Int? // hovered bar in the trend strip
     @Published var contentHeight: CGFloat = 0 // measured panel content, for the popover's scroll cap
@@ -680,12 +681,20 @@ struct WidgetView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
             if let r = store.report {
-                if r.devices.count > 1 { devicesRow(r) }
-                filters(r)
-                if !r.quotas.isEmpty { quotas(r) }
-                hero(r)
-                activity(r)
-                breakdown(r)
+                controls(r)
+                switch store.page {
+                case "breakdown":
+                    filters(r)
+                    tokenMix(r)
+                    breakdown(r)
+                case "history":
+                    activity(r)
+                    monthly(r)
+                default:
+                    hero(r)
+                    if !r.quotas.isEmpty { quotas(r) }
+                    totals(r)
+                }
                 if !r.unpriced.isEmpty {
                     Label("No price for \(r.unpriced.sorted().joined(separator: ", ")) — add it in Settings › Pricing",
                           systemImage: "exclamationmark.triangle")
@@ -713,8 +722,31 @@ struct WidgetView: View {
             .contentShape(Rectangle())
             .overlay(inPopover ? nil : DragHandle(menu: menu)) // desktop: drag to move, right-click for menu
             Spacer(minLength: 4)
-            ForEach(Preset.allCases) { p in
-                tab(p.rawValue, pickedDay == nil && store.preset == p) { store.preset = p; store.pickedDay = nil }
+            ForEach([("Overview", "overview"), ("Breakdown", "breakdown"), ("History", "history")], id: \.1) { t in
+                tab(t.0, store.page == t.1) { store.page = t.1 }
+            }
+        }
+    }
+
+    /// Range and device pickers, shared by every page.
+    func controls(_ r: Report) -> some View {
+        HStack(spacing: 8) {
+            Picker("", selection: Binding(get: { store.preset }, set: { store.preset = $0; store.pickedDay = nil })) {
+                ForEach(Preset.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.menu).labelsHidden().controlSize(.small).fixedSize()
+            .opacity(pickedDay == nil ? 1 : 0.45)
+            if let d = pickedDay {
+                tab("\(dayLabel(d)) ✕", true) { store.pickedDay = nil }.help("Back to \(store.preset.title)")
+            }
+            Spacer()
+            if r.devices.count > 1 {
+                Picker("", selection: Binding(get: { store.device }, set: { store.device = $0 })) {
+                    Text("All \(r.devices.count) devices").tag(String?.none)
+                    Divider()
+                    ForEach(r.devices, id: \.self) { Text($0).tag(String?.some($0)) }
+                }
+                .pickerStyle(.menu).labelsHidden().controlSize(.small).fixedSize()
             }
         }
     }
@@ -841,12 +873,10 @@ struct WidgetView: View {
         let cur = sum(es)
         let prev = store.preset == .all && pickedDay == nil ? Row() : sum(scoped(r, g.previous.from, g.previous.to))
         let remote = es.contains { $0.device != thisMac }
-        let inputSide = cur.input + cur.cacheRead + cur.cacheWrite
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 cap("\(g.title) · \(scopeName)")
                 Spacer()
-                if pickedDay != nil { tab("Clear", false) { store.pickedDay = nil } }
             }
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(usd(cur.cost)).font(.system(size: 38, weight: .light).width(.expanded)).monospacedDigit()
@@ -869,7 +899,17 @@ struct WidgetView: View {
                 Text("Other devices report daily totals; they appear in the first hour.")
                     .font(.system(size: 9.5)).foregroundColor(.secondary)
             }
-            Divider().opacity(0.6)
+        }
+        .card()
+    }
+
+    /// Breakdown page: what the tokens are made of, and what the cache saved.
+    func tokenMix(_ r: Report) -> some View {
+        let g = store.span
+        let cur = sum(scoped(r, g.from, g.to))
+        let inputSide = cur.input + cur.cacheRead + cur.cacheWrite
+        return VStack(alignment: .leading, spacing: 8) {
+            cap("Token mix · \(g.title) · \(tok(cur.tokens))")
             HStack(alignment: .top, spacing: 10) {
                 mix("Input", cur.input, cur.tokens)
                 mix("Output", cur.output, cur.tokens)
@@ -877,6 +917,18 @@ struct WidgetView: View {
                 mix("Writes", cur.cacheWrite, cur.tokens)
             }
             cap("Cache hit \(inputSide > 0 ? String(format: "%.0f%%", cur.cacheRead / inputSide * 100) : "—") · saved \(usd(cur.saved)) · list prices")
+        }
+        .card()
+    }
+
+    /// Overview page: the running totals, one line.
+    func totals(_ r: Report) -> some View {
+        let c7 = sum(scoped(r, daysAgo(6), tomorrow())).cost
+        let c30 = sum(scoped(r, daysAgo(29), tomorrow())).cost
+        return HStack(spacing: 0) {
+            stat("Today", usd(sum(scoped(r, today(), tomorrow())).cost))
+            stat("Last 7 days", usd(c7))
+            stat("Last 30 days", usd(c30))
         }
         .card()
     }
@@ -985,8 +1037,6 @@ struct WidgetView: View {
             .mapValues { $0.reduce(0) { $0 + $1.row.cost } }
         let maxV = daily.values.max() ?? 0
         let peak = daily.max { $0.value < $1.value }
-        let c7 = sum(scoped(r, daysAgo(6), tomorrow())).cost
-        let c30 = sum(scoped(r, daysAgo(29), tomorrow())).cost
         let g = store.span
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -1012,11 +1062,37 @@ struct WidgetView: View {
                 }
             }
             cap("Dot size = cost that day · click to focus")
+        }
+        .card()
+    }
+
+    /// History page: every month on record, newest first.
+    func monthly(_ r: Report) -> some View {
+        let first = cal.dateInterval(of: .month, for: r.firstDay ?? today())!.start
+        let all = Span(from: first, to: tomorrow(), days: 1, title: "All time", unit: .month)
+        let es = scoped(r, all.from, all.to)
+        let byMonth = Dictionary(grouping: es, by: { cal.dateInterval(of: .month, for: $0.day)!.start }).mapValues { sum($0) }
+        let months = byMonth.keys.sorted(by: >)
+        let total = sum(es)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                cap("All time · \(scopeName)")
+                Spacer()
+                cap("\(usd(total.cost)) · \(tok(total.tokens))")
+            }
+            trend(r, all)
             Divider().opacity(0.6)
-            HStack(spacing: 0) {
-                stat("Last 7 days", usd(c7))
-                stat("Last 30 days", usd(c30))
-                stat("Daily avg", usd(c30 / 30))
+            VStack(spacing: 0) {
+                ForEach(months, id: \.self) { m in
+                    HStack {
+                        Text(m.formatted(.dateTime.month(.wide).year()))
+                        Spacer()
+                        Text(tok(byMonth[m]!.tokens)).foregroundColor(.secondary).frame(width: 70, alignment: .trailing)
+                        Text(usd(byMonth[m]!.cost)).frame(width: 74, alignment: .trailing)
+                    }
+                    .font(.system(size: 11.5)).monospacedDigit().padding(.vertical, 4)
+                    Divider().opacity(0.4)
+                }
             }
         }
         .card()
@@ -1375,6 +1451,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let v = arg("project") { store.project = v }
         if let v = arg("hover") { store.hover = Int(v) }
         if let v = arg("device") { store.device = v }
+        if let v = arg("page") { store.page = v }
         window.contentView?.layer?.backgroundColor = NSColor(white: 0.13, alpha: 1).cgColor
         if let blur = window.contentView, args.contains("--popover") || args.contains("--settings") {
             hosting.removeFromSuperview()
