@@ -512,6 +512,8 @@ final class Prefs: ObservableObject {
         let i = Prefs.textScales.firstIndex(of: textScale) ?? 1
         textScale = Prefs.textScales[max(0, min(Prefs.textScales.count - 1, i + d))]
     }
+    /// Solid dark panel background (default), so text stays readable over light windows; off = see-through glass.
+    @Published var solidBackground: Bool { didSet { ud.set(solidBackground, forKey: "solidBackground"); onChange?() } }
     /// Panel text size: 1.0 default, 1.15 large, 1.3 larger.
     @Published var textScale: CGFloat { didSet { ud.set(Double(textScale), forKey: "textScale"); onChange?() } }
     @Published var launchAtLogin: Bool {
@@ -536,6 +538,7 @@ final class Prefs: ObservableObject {
         showDesktopWidget = ud.bool(forKey: "showDesktopWidget")
         includeOtherDevices = ud.bool(forKey: "includeOtherDevices")
         textScale = CGFloat(ud.object(forKey: "textScale") as? Double ?? 1.15)
+        solidBackground = ud.object(forKey: "solidBackground") as? Bool ?? true
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 }
@@ -604,6 +607,7 @@ final class Store: ObservableObject {
 // MARK: - Widget UI
 
 let accent = Color(red: 0.67, green: 0.58, blue: 1.0)
+let panelBackground = Color(red: 0.09, green: 0.09, blue: 0.11)
 
 /// Text size from Settings; the panel widens with it so rows don't truncate.
 func fs(_ size: CGFloat) -> CGFloat { (size * Prefs.shared.textScale).rounded() }
@@ -685,6 +689,7 @@ struct WidgetView: View {
                 content.background(GeometryReader { Color.clear.preference(key: HeightKey.self, value: $0.size.height) })
             }
             .frame(width: panelWidth, height: min(max(store.contentHeight, 120), maxH))
+            .background(prefs.solidBackground ? panelBackground.ignoresSafeArea() : nil)
             .onPreferenceChange(HeightKey.self) { store.contentHeight = $0 }
         } else {
             content
@@ -1297,13 +1302,14 @@ struct SettingsView: View {
                 Text("From this level the fullest plan limit appears next to the cost, in orange, and red from 90%.")
                     .font(.system(size: fs(11))).foregroundColor(.secondary)
             }
-            Section("Text size") {
+            Section("Appearance") {
                 Picker("Panel text", selection: $prefs.textScale) {
                     Text("Default").tag(CGFloat(1.0))
                     Text("Large").tag(CGFloat(1.15))
                     Text("Larger").tag(CGFloat(1.3))
                 }
                 .pickerStyle(.segmented)
+                Toggle("Solid background (clearer over light windows)", isOn: $prefs.solidBackground)
             }
             Section("General") {
                 Toggle("Launch at login", isOn: $prefs.launchAtLogin)
@@ -1434,11 +1440,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window.setFrameTopLeftPoint(NSPoint(x: screen.maxX - 380, y: screen.maxY - 40))
         }
         window.setFrameAutosaveName(name)
+        if prefs.solidBackground { blur.layer?.backgroundColor = NSColor(red: 0.09, green: 0.09, blue: 0.11, alpha: 0.96).cgColor }
         if prefs.showDesktopWidget || CommandLine.arguments.contains("--snapshot") { window.orderFront(nil) }
     }
 
     func applyPrefs() {
         if let r = store.report { setStatusTitle(r) }
+        window.contentView?.layer?.backgroundColor = prefs.solidBackground ? NSColor(red: 0.09, green: 0.09, blue: 0.11, alpha: 0.96).cgColor : nil
         if prefs.showDesktopWidget != window.isVisible {
             if prefs.showDesktopWidget { window.orderFront(nil) } else { window.orderOut(nil) }
         }

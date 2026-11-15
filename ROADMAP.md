@@ -25,6 +25,9 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.14.2 — readable over light windows
+The see-through glass panel washed out over white windows. The panel (and desktop widget) now has a solid dark background by default; Settings → Appearance → "Solid background" turns the glass back on.
+
 ### v0.14.0 — text size
 Text size: Default / Large (new default) / Larger, changed in the panel footer (A− / A+, ⌘− / ⌘+), the right-click menu (Text Size) or Settings. Fonts, table columns and the panel width (360 → 414 → 468 pt) scale together.
 
