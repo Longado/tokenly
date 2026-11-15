@@ -549,10 +549,10 @@ let alertThresholds = [("Off", 0), ("70%", 70), ("80%", 80), ("90%", 90)]
 // MARK: - Store
 
 enum Preset: String, CaseIterable, Identifiable {
-    case today = "Today", h24 = "24H", week = "7D", month = "30D", quarter = "90D", all = "All"
+    case today = "Today", h24 = "24H", week = "7D", month = "30D", quarter = "90D", all = "All", custom = "Custom"
     var id: String { rawValue }
-    var days: Int { [1, 1, 7, 30, 90, 0][Preset.allCases.firstIndex(of: self)!] }
-    var title: String { ["Today", "Last 24 hours", "Last 7 days", "Last 30 days", "Last 90 days", "All time"][Preset.allCases.firstIndex(of: self)!] }
+    var days: Int { [1, 1, 7, 30, 90, 0, 0][Preset.allCases.firstIndex(of: self)!] }
+    var title: String { ["Today", "Last 24 hours", "Last 7 days", "Last 30 days", "Last 90 days", "All time", "Custom range…"][Preset.allCases.firstIndex(of: self)!] }
 }
 
 /// A time range [from, to), charted by `unit` (.hour, .day or .month).
@@ -571,6 +571,8 @@ final class Store: ObservableObject {
     @Published var project: String? // nil = all projects
     @Published var device: String? // nil = all devices
     @Published var page = "overview" // overview | breakdown | history
+    @Published var customFrom = daysAgo(13) // Custom range, inclusive local days
+    @Published var customTo = today()
     @Published var mode = "provider" // breakdown: provider | model | project | day
     @Published var hover: Int? // hovered bar in the trend strip
     @Published var contentHeight: CGFloat = 0 // measured panel content, for the popover's scroll cap
@@ -595,6 +597,12 @@ final class Store: ObservableObject {
         case .h24:
             let next = cal.dateInterval(of: .hour, for: Date())!.end
             return Span(from: next.addingTimeInterval(-86400), to: next, days: 1, title: preset.title, unit: .hour)
+        case .custom:
+            let from = cal.startOfDay(for: min(customFrom, customTo)), last = cal.startOfDay(for: max(customFrom, customTo))
+            let to = cal.date(byAdding: .day, value: 1, to: last)!
+            let days = max(1, cal.dateComponents([.day], from: from, to: to).day ?? 1)
+            let title = days == 1 ? dayLabel(from) : "\(dayLabel(from)) – \(dayLabel(last))"
+            return Span(from: from, to: to, days: days, title: title, unit: days == 1 ? .hour : days > 120 ? .month : .day)
         case .all:
             let first = cal.dateInterval(of: .month, for: report?.firstDay ?? today())!.start
             let days = (cal.dateComponents([.day], from: first, to: tomorrow()).day ?? 1)
@@ -747,27 +755,61 @@ struct WidgetView: View {
         }
     }
 
-    /// Range and device pickers, shared by every page.
+    /// Period pills (like Vibe Usage's date row), custom dates, and the device picker; shared by every page.
     func controls(_ r: Report) -> some View {
-        HStack(spacing: 8) {
-            Picker("", selection: Binding(get: { store.preset }, set: { store.preset = $0; store.pickedDay = nil })) {
-                ForEach(Preset.allCases) { Text($0.title).tag($0) }
-            }
-            .pickerStyle(.menu).labelsHidden().controlSize(.small).fixedSize()
-            .opacity(pickedDay == nil ? 1 : 0.45)
-            if let d = pickedDay {
-                tab("\(dayLabel(d)) ✕", true) { store.pickedDay = nil }.help("Back to \(store.preset.title)")
-            }
-            Spacer()
-            if r.devices.count > 1 {
-                Picker("", selection: Binding(get: { store.device }, set: { store.device = $0 })) {
-                    Text("All \(r.devices.count) devices").tag(String?.none)
-                    Divider()
-                    ForEach(r.devices, id: \.self) { Text($0).tag(String?.some($0)) }
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 5) {
+                ForEach(Preset.allCases) { p in
+                    pill(p == .custom ? "Custom" : p.rawValue, pickedDay == nil && store.preset == p) {
+                        store.preset = p; store.pickedDay = nil
+                    }
                 }
-                .pickerStyle(.menu).labelsHidden().controlSize(.small).fixedSize()
+                Spacer(minLength: 0)
+            }
+            if pickedDay == nil && store.preset == .custom {
+                HStack(spacing: 6) {
+                    cap("From")
+                    DatePicker("", selection: Binding(get: { store.customFrom }, set: { store.customFrom = $0; store.hover = nil }),
+                               in: ...today(), displayedComponents: .date)
+                        .datePickerStyle(.field).labelsHidden().controlSize(.small).fixedSize()
+                    cap("To")
+                    DatePicker("", selection: Binding(get: { store.customTo }, set: { store.customTo = $0; store.hover = nil }),
+                               in: store.customFrom...today(), displayedComponents: .date)
+                        .datePickerStyle(.field).labelsHidden().controlSize(.small).fixedSize()
+                    Spacer(minLength: 0)
+                }
+            }
+            if pickedDay != nil || r.devices.count > 1 {
+                HStack(spacing: 6) {
+                    if let d = pickedDay {
+                        pill("\(dayLabel(d))  ✕", true) { store.pickedDay = nil }.help("Back to \(store.preset.title)")
+                    }
+                    Spacer(minLength: 0)
+                    if r.devices.count > 1 {
+                        Picker("", selection: Binding(get: { store.device }, set: { store.device = $0 })) {
+                            Text("All \(r.devices.count) devices").tag(String?.none)
+                            Divider()
+                            ForEach(r.devices, id: \.self) { Text($0).tag(String?.some($0)) }
+                        }
+                        .pickerStyle(.menu).labelsHidden().controlSize(.small).fixedSize()
+                    }
+                }
             }
         }
+    }
+
+    /// Rounded selectable pill, shared by the period row.
+    func pill(_ label: String, _ on: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label).fixedSize()
+                .font(.system(size: fs(11), weight: on ? .semibold : .medium))
+                .padding(.horizontal, fs(8)).padding(.vertical, fs(3.5))
+                .background(Capsule().fill(on ? accent.opacity(0.22) : Color.primary.opacity(0.06)))
+                .overlay(Capsule().strokeBorder(on ? accent.opacity(0.8) : Color.clear, lineWidth: 1))
+                .foregroundColor(on ? .primary : .secondary)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
     }
 
     /// Shown once other devices are imported: all devices, this Mac, or one device picked in the breakdown.
@@ -910,7 +952,8 @@ struct WidgetView: View {
                 }
             }
             Text(insight(es, cur, g.days)).font(.system(size: fs(12))).foregroundColor(.primary.opacity(0.85))
-            Text("\(tok(cur.tokens)) tokens · \(Int(cur.calls)) calls · \(duration(activeSeconds(es))) active\(remote ? " on this Mac" : "")")
+            Text(cur.calls == 0 ? "\(tok(cur.tokens)) tokens"
+                 : "\(tok(cur.tokens)) tokens · \(Int(cur.calls)) calls · \(duration(activeSeconds(es))) active\(remote ? " on this Mac" : "")")
                 .font(.system(size: fs(10.5))).foregroundColor(.secondary).monospacedDigit()
                 .help("Active time: 5-minute slots with at least one model call")
             trend(r, g)
@@ -1488,6 +1531,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let v = arg("hover") { store.hover = Int(v) }
         if let v = arg("device") { store.device = v }
         if let v = arg("page") { store.page = v }
+        if mode == "custom" {
+            store.preset = .custom
+            if let v = arg("from"), let d = parseDate(v + "T00:00:00Z") { store.customFrom = cal.startOfDay(for: d.addingTimeInterval(43200)) }
+            if let v = arg("to"), let d = parseDate(v + "T00:00:00Z") { store.customTo = cal.startOfDay(for: d.addingTimeInterval(43200)) }
+        }
         window.contentView?.layer?.backgroundColor = NSColor(white: 0.13, alpha: 1).cgColor
         if let blur = window.contentView, args.contains("--popover") || args.contains("--settings") {
             hosting.removeFromSuperview()

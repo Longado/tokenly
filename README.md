@@ -47,7 +47,7 @@ today's cost; click it for the usage panel, right-click for the menu. It refresh
   downloads your account's usage from vibecafe.ai (read-only, with the key Vibe Usage stored) back to your first
   synced day. Adds a Devices switch (All / This Mac / one device), a Device breakdown and the All range with monthly
   bars. This Mac's numbers still come from its own logs; other devices report daily totals.
-- Ranges: Today / 24H / 7D / 30D / 90D / All, or click any day. Today, 24H and single days chart by hour.
+- Ranges: period pills Today / 24H / 7D / 30D / 90D / All / Custom (From–To dates), or click any day. Today, 24H and single days chart by hour.
 - Trend strip under the headline number: hover a bar for its cost and tokens, click a day bar to focus it.
 - Active time: 5-minute slots with at least one model call.
 - Settings window (menu → Settings…): menu bar format (cost / tokens / both / fullest plan limit),
@@ -68,7 +68,7 @@ macos/build.sh            # -> macos/build/TokenMeter.app
 cp -R macos/build/TokenMeter.app /Applications/
 ```
 
-`TokenMeter --snapshot out.png [today|24h|week|month|90d|all|dayN] [--popover|--settings] [hover=N] [device=name] [page=overview|breakdown|history] [provider=OpenAI] [model=gpt-6.1-sol] [project=name] [mode=provider|model|project|day]` renders the panel to a PNG (for development).
+`TokenMeter --snapshot out.png [today|24h|week|month|90d|all|custom from=YYYY-MM-DD to=YYYY-MM-DD|dayN] [--popover|--settings] [hover=N] [device=name] [page=overview|breakdown|history] [provider=OpenAI] [model=gpt-6.1-sol] [project=name] [mode=provider|model|project|day]` renders the panel to a PNG (for development).
 
 Prices are in `macos/main.swift` (`prices`) and `tokenmeter.py` (`PRICES`); keep them in sync.
 

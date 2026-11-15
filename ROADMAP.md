@@ -25,6 +25,12 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.15.0 — choose any period
+- **Period pills.** Today / 24H / 7D / 30D / 90D / All / Custom, as one row of pills, the way Vibe Usage presents its date filter. They replace the period dropdown.
+- **Custom.** Shows From / To date fields. Ranges of one day chart by hour, up to 120 days by day, and longer ranges by month. The comparison uses the previous period of the same length.
+- **Device picker** moved to its own line, shared with the "picked day ✕" pill.
+- **No zero line.** Calls and active time are hidden when the period has no data from this Mac.
+
 ### v0.14.2 — readable over light windows
 The see-through glass panel washed out over white windows. The panel (and desktop widget) now has a solid dark background by default; Settings → Appearance → "Solid background" turns the glass back on.
 
