@@ -31,17 +31,23 @@ TOTAL                      2,001,200     370,000    48,000,000     900,000    51
 ```
 *(sample numbers)*
 
-## Desktop widget (macOS)
+## macOS app (desktop widget + menu bar)
 
-A desktop widget for [Übersicht](https://tracesof.net/uebersicht/) lives in `widgets/tokenmeter.widget`.
-It shows today's and last-30-day cost plus a per-model breakdown, refreshing every 5 minutes.
+`TokenMeter.app` is a native, dependency-free macOS app (13+) that shows a translucent
+widget on the desktop and today's cost in the menu bar. It refreshes every 5 minutes and on wake.
+
+- Drag the widget anywhere; the position is remembered.
+- Menu bar / right-click menu: Refresh, Show Widget, Launch at Login, Quit.
+
+Download `TokenMeter.zip` from Releases, unzip, move to `/Applications`. The app is ad-hoc
+signed, so the first launch needs right-click → Open. Or build it yourself (Xcode command line tools only):
 
 ```bash
-brew install --cask ubersicht
-ln -s "$PWD/widgets/tokenmeter.widget" ~/Library/Application\ Support/Übersicht/widgets/
+macos/build.sh            # -> macos/build/TokenMeter.app
+cp -R macos/build/TokenMeter.app /Applications/
 ```
 
-The widget runs `tokenmeter 30 --json`; if `tokenmeter` is not on your PATH, edit `TOKENMETER` at the top of `index.jsx`.
+Prices are in `macos/main.swift` (`prices`) and `tokenmeter.py` (`PRICES`); keep them in sync.
 
 ## Data sources
 
