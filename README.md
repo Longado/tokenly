@@ -36,6 +36,9 @@ TOTAL                      2,001,200     370,000    48,000,000     900,000    51
 `TokenMeter.app` is a native, dependency-free macOS menu bar app (13+). The menu bar shows
 today's cost; click it for the usage panel, right-click for the menu. It refreshes every 5 minutes and on wake.
 
+- Plan limits: Claude and Codex subscription windows (5h / 7d) as the tools last recorded them locally,
+  with reset times; the menu bar flags any limit above 80%.
+- Projects: breakdown by project (working directory) and a project filter.
 - Hero: cost for the range, change vs the previous period, a one-line takeaway
   ("$0.79 a day. Anthropic took 94% of it."), and the token mix (input / output / cached / cache writes).
 - Filters: provider (All / Anthropic / OpenAI / Google, derived from the model name) and a model dropdown grouped by provider.
@@ -52,7 +55,7 @@ macos/build.sh            # -> macos/build/TokenMeter.app
 cp -R macos/build/TokenMeter.app /Applications/
 ```
 
-`TokenMeter --snapshot out.png [today|week|month|dayN] [--popover] [provider=OpenAI] [model=gpt-6.1-sol] [mode=provider|model|day]` renders the panel to a PNG (for development).
+`TokenMeter --snapshot out.png [today|week|month|dayN] [--popover] [provider=OpenAI] [model=gpt-6.1-sol] [project=name] [mode=provider|model|project|day]` renders the panel to a PNG (for development).
 
 Prices are in `macos/main.swift` (`prices`) and `tokenmeter.py` (`PRICES`); keep them in sync.
 
@@ -75,6 +78,8 @@ are counted as $0 and listed at the end of the output — PRs welcome.
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+See [ROADMAP.md](ROADMAP.md) for positioning and what comes next.
 
 ## License
 

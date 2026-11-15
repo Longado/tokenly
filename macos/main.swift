@@ -45,16 +45,30 @@ struct Row {
     }
 }
 
-/// Usage of one model on one tool on one local day.
+/// Usage of one model in one project on one local day.
 struct Entry {
-    let day: Date, tool: String, model: String
+    let day: Date, tool: String, model: String, project: String
     var row: Row
     var provider: String { providerOf(model) }
+}
+
+/// One subscription limit window, e.g. "7d" at 88%.
+struct QuotaMeter: Identifiable {
+    let label: String, percent: Double, resetsAt: Date?
+    var id: String { label }
+}
+
+/// Subscription usage as last recorded locally by the tool itself.
+struct Quota: Identifiable {
+    let product: String, plan: String?, meters: [QuotaMeter], asOf: Date?
+    var id: String { product }
+    var peak: Double { meters.map { $0.percent }.max() ?? 0 }
 }
 
 struct Report {
     var entries: [Entry] = []
     var unpriced: Set<String> = []
+    var quotas: [Quota] = []
     var updated = Date()
 
     func entries(from: Date, to: Date) -> [Entry] { entries.filter { $0.day >= from && $0.day <= to } }
@@ -68,88 +82,190 @@ let cal = Calendar.current
 func today() -> Date { cal.startOfDay(for: Date()) }
 func daysAgo(_ n: Int) -> Date { cal.date(byAdding: .day, value: -n, to: today())! }
 
-final class Scanner {
-    let since = daysAgo(scanDays - 1)
+private let isoFrac: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+private let isoPlain = ISO8601DateFormatter()
+/// ISO-8601 with or without fractional seconds (any number of digits).
+func parseDate(_ v: Any?) -> Date? {
+    guard let s = v as? String else { return nil }
+    if let d = isoFrac.date(from: s) ?? isoPlain.date(from: s) { return d }
+    return isoPlain.date(from: s.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression))
+}
+
+/// Parse state of one log file, so a refresh only reads what was appended since the last one.
+final class FileState {
+    var size: UInt64 = 0, mtime = Date.distantPast, offset: UInt64 = 0
     var buckets: [String: Entry] = [:]
     var unpriced = Set<String>()
-    private let isoFrac: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-    private let iso = ISO8601DateFormatter()
+    var model = "?", project = "" // Codex: set by turn_context lines, apply to later events
+    var rateLimits: (at: Date, value: [String: Any])? // Codex: newest rate_limits seen in this file
+}
 
-    func add(_ ts: Any?, _ tool: String, _ model: String,
+/// Long-lived: keeps per-file results between refreshes and reads files in 1 MiB chunks,
+/// so large, growing session logs cost neither repeated full reads nor file-sized memory.
+final class Scanner {
+    private var files: [String: FileState] = [:]
+    private var seenClaude = Set<String>()
+    private let env = ProcessInfo.processInfo.environment
+
+    func add(_ st: FileState, _ date: Date, _ tool: String, _ model: String, _ project: String,
              _ i: Double, _ o: Double, _ cr: Double, _ cw: Double, _ cw1h: Double = 0) {
-        guard let s = ts as? String, let date = isoFrac.date(from: s) ?? iso.date(from: s), date >= since,
-              i + o + cr + cw > 0 else { return }
+        guard i + o + cr + cw > 0 else { return }
         let p = prices[model] ?? [0, 0, 0, 0, 0]
-        if prices[model] == nil { unpriced.insert(model) }
+        if prices[model] == nil { st.unpriced.insert(model) }
         let cost = (i * p[0] + o * p[1] + cr * p[2] + (cw - cw1h) * p[3] + cw1h * p[4]) / 1e6
         let r = Row(input: i, output: o, cacheRead: cr, cacheWrite: cw, cost: cost, saved: cr * (p[0] - p[2]) / 1e6, calls: 1)
         let day = cal.startOfDay(for: date)
-        let key = "\(day.timeIntervalSince1970)|\(tool)|\(model)"
-        buckets[key, default: Entry(day: day, tool: tool, model: model, row: Row())].row.add(r)
+        let key = "\(day.timeIntervalSince1970)|\(model)|\(project)"
+        st.buckets[key, default: Entry(day: day, tool: tool, model: model, project: project, row: Row())].row.add(r)
     }
 
-    /// Lines of every .jsonl under `dir` modified within the scan window.
-    func files(under dir: String) -> [[Substring]] {
+    /// .jsonl files under `dir` modified since `since`.
+    func jsonl(under dir: String, since: Date) -> [String] {
         let url = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
         guard let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
-        var out: [[Substring]] = []
+        var out: [String] = []
         for case let f as URL in e where f.pathExtension == "jsonl" {
             let mod = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
             if let mod = mod, mod < since { continue }
-            if let s = try? String(contentsOf: f, encoding: .utf8) { out.append(s.split(separator: "\n")) }
+            out.append(f.path)
         }
         return out
+    }
+
+    /// Feeds each complete line appended to `path` since the last scan to `body`.
+    func scan(_ path: String, _ body: (FileState, Substring) -> Void) {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = (attrs[.size] as? NSNumber)?.uint64Value,
+              let mtime = attrs[.modificationDate] as? Date else { return }
+        var st = files[path] ?? FileState()
+        if size < st.offset { st = FileState() } // truncated or rewritten
+        files[path] = st
+        if size == st.size && mtime == st.mtime { return }
+        guard let h = FileHandle(forReadingAtPath: path) else { return }
+        defer { try? h.close() }
+        h.seek(toFileOffset: st.offset)
+        var carry = Data()
+        while true {
+            let chunk: Data = autoreleasepool { h.readData(ofLength: 1 << 20) }
+            if chunk.isEmpty { break }
+            carry.append(chunk)
+            guard let nl = carry.lastIndex(of: 0x0A) else { continue } // a line longer than one chunk
+            let complete = carry[carry.startIndex...nl]
+            autoreleasepool {
+                for line in String(decoding: complete, as: UTF8.self).split(separator: "\n") { body(st, line) }
+            }
+            st.offset += UInt64(complete.count)
+            carry = Data(carry[carry.index(after: nl)...])
+        }
+        st.size = size; st.mtime = mtime
     }
 
     func json(_ line: Substring) -> [String: Any]? {
         try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
     }
 
-    func scanClaude(_ root: String) {
-        var seen = Set<String>()
-        for file in files(under: root + "/projects") {
-            for line in file where line.contains("\"usage\"") {
-                guard let d = json(line), let m = d["message"] as? [String: Any],
-                      let u = m["usage"] as? [String: Any] else { continue }
-                // the same message can be logged several times
-                if !seen.insert("\(m["id"] ?? "")|\(d["requestId"] ?? "")").inserted { continue }
+    func scanClaude(_ root: String, since: Date) -> [String] {
+        let paths = jsonl(under: root + "/projects", since: since)
+        for path in paths {
+            scan(path) { st, line in
+                guard line.contains("\"usage\""), let d = json(line), let m = d["message"] as? [String: Any],
+                      let u = m["usage"] as? [String: Any], let date = parseDate(d["timestamp"]) else { return }
+                // the same message can be logged several times, also across session files
+                if !seenClaude.insert("\(m["id"] ?? "")|\(d["requestId"] ?? "")").inserted { return }
                 let cc = u["cache_creation"] as? [String: Any]
-                add(d["timestamp"], "Claude Code", m["model"] as? String ?? "?",
+                add(st, date, "Claude Code", m["model"] as? String ?? "?",
+                    ((d["cwd"] as? String ?? "") as NSString).lastPathComponent,
                     num(u["input_tokens"]), num(u["output_tokens"]),
                     num(u["cache_read_input_tokens"]), num(u["cache_creation_input_tokens"]),
                     num(cc?["ephemeral_1h_input_tokens"]))
             }
         }
+        return paths
     }
 
-    func scanCodex(_ root: String) {
-        for file in files(under: root + "/sessions") {
-            var model = "?"
-            for line in file where line.contains("turn_context") || line.contains("token_count") {
-                guard let d = json(line), let p = d["payload"] as? [String: Any] else { continue }
-                if d["type"] as? String == "turn_context", let m = p["model"] as? String {
-                    model = m
-                } else if p["type"] as? String == "token_count",
-                          let u = (p["info"] as? [String: Any])?["last_token_usage"] as? [String: Any] {
-                    // input includes cached tokens
-                    let c = num(u["cached_input_tokens"])
-                    add(d["timestamp"], "Codex", model, num(u["input_tokens"]) - c, num(u["output_tokens"]),
-                        c, num(u["cache_write_input_tokens"]))
+    func scanCodex(_ root: String, since: Date) -> [String] {
+        let paths = jsonl(under: root + "/sessions", since: since)
+        for path in paths {
+            scan(path) { st, line in
+                guard line.contains("turn_context") || line.contains("token_count"),
+                      let d = json(line), let p = d["payload"] as? [String: Any] else { return }
+                if d["type"] as? String == "turn_context" {
+                    if let m = p["model"] as? String { st.model = m }
+                    if let c = p["cwd"] as? String { st.project = (c as NSString).lastPathComponent }
+                } else if p["type"] as? String == "token_count", let date = parseDate(d["timestamp"]) {
+                    if let u = (p["info"] as? [String: Any])?["last_token_usage"] as? [String: Any] {
+                        let c = num(u["cached_input_tokens"]) // input includes cached tokens
+                        add(st, date, "Codex", st.model, st.project, num(u["input_tokens"]) - c,
+                            num(u["output_tokens"]), c, num(u["cache_write_input_tokens"]))
+                    }
+                    if let rl = p["rate_limits"] as? [String: Any], date >= (st.rateLimits?.at ?? .distantPast) {
+                        st.rateLimits = (date, rl)
+                    }
                 }
             }
         }
+        return paths
     }
 
-    static func run() -> Report {
-        let env = ProcessInfo.processInfo.environment
-        let s = Scanner()
-        s.scanClaude(env["CLAUDE_CONFIG_DIR"] ?? "~/.claude")
-        s.scanCodex(env["CODEX_HOME"] ?? "~/.codex")
-        return Report(entries: Array(s.buckets.values), unpriced: s.unpriced)
+    // MARK: quotas
+
+    static func windowLabel(minutes: Double) -> String {
+        minutes == 10080 ? "7d" : minutes.truncatingRemainder(dividingBy: 1440) == 0
+            ? "\(Int(minutes / 1440))d" : "\(Int((minutes / 60).rounded()))h"
+    }
+
+    /// Codex: newest `rate_limits` from its session logs. Windows that already reset are dropped.
+    func codexQuota() -> Quota? {
+        guard let (at, rl) = files.values.compactMap({ $0.rateLimits }).max(by: { $0.at < $1.at }) else { return nil }
+        let meters = ["primary", "secondary"].compactMap { k -> QuotaMeter? in
+            guard let w = rl[k] as? [String: Any] else { return nil }
+            let reset = (w["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+            if let reset = reset, reset < Date() { return nil }
+            return QuotaMeter(label: Scanner.windowLabel(minutes: num(w["window_minutes"])),
+                              percent: num(w["used_percent"]), resetsAt: reset)
+        }.sorted { ($0.resetsAt ?? .distantFuture) < ($1.resetsAt ?? .distantFuture) }
+        if meters.isEmpty { return nil }
+        return Quota(product: "Codex", plan: (rl["plan_type"] as? String)?.capitalized, meters: meters, asOf: at)
+    }
+
+    /// Claude: the utilization Claude Code caches in ~/.claude.json. Windows that already reset are dropped.
+    func claudeQuota() -> Quota? {
+        let dir = env["CLAUDE_CONFIG_DIR"] ?? NSHomeDirectory()
+        guard let data = FileManager.default.contents(atPath: dir + "/.claude.json"),
+              let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cache = d["cachedUsageUtilization"] as? [String: Any],
+              let u = cache["utilization"] as? [String: Any] else { return nil }
+        let names = [("five_hour", "5h"), ("seven_day", "7d"), ("seven_day_opus", "7d Opus"), ("seven_day_sonnet", "7d Sonnet")]
+        let meters = names.compactMap { key, label -> QuotaMeter? in
+            guard let w = u[key] as? [String: Any], w["utilization"] is NSNumber else { return nil }
+            let reset = parseDate(w["resets_at"])
+            if let reset = reset, reset < Date() { return nil }
+            return QuotaMeter(label: label, percent: num(w["utilization"]), resetsAt: reset)
+        }
+        if meters.isEmpty { return nil }
+        let asOf = (cache["fetchedAtMs"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
+        return Quota(product: "Claude", plan: nil, meters: meters, asOf: asOf)
+    }
+
+    func run() -> Report {
+        let since = daysAgo(scanDays - 1)
+        let alive = Set(scanClaude(env["CLAUDE_CONFIG_DIR"] ?? "~/.claude", since: since)
+                        + scanCodex(env["CODEX_HOME"] ?? "~/.codex", since: since))
+        files = files.filter { alive.contains($0.key) } // forget files that aged out
+        var merged: [String: Entry] = [:]
+        var unpriced = Set<String>()
+        for st in files.values {
+            unpriced.formUnion(st.unpriced)
+            for (k, e) in st.buckets where e.day >= since {
+                if merged[k] == nil { merged[k] = e } else { merged[k]!.row.add(e.row) }
+            }
+        }
+        return Report(entries: Array(merged.values), unpriced: unpriced,
+                      quotas: [claudeQuota(), codexQuota()].compactMap { $0 })
     }
 }
 
@@ -160,6 +276,12 @@ func tok(_ v: Double) -> String {
     v >= 1e9 ? String(format: "%.1fB", v / 1e9) : v >= 1e6 ? String(format: "%.1fM", v / 1e6) : v >= 1e3 ? String(format: "%.0fK", v / 1e3) : String(format: "%.0f", v)
 }
 func dayLabel(_ d: Date) -> String { d.formatted(.dateTime.month(.abbreviated).day()) }
+private let relFmt: RelativeDateTimeFormatter = {
+    let f = RelativeDateTimeFormatter()
+    f.unitsStyle = .short
+    return f
+}()
+func relative(_ d: Date) -> String { relFmt.localizedString(for: d, relativeTo: Date()) }
 
 // MARK: - Store
 
@@ -169,11 +291,15 @@ final class Store: ObservableObject {
     @Published var pickedDay: Date?
     @Published var provider: String? // nil = all providers
     @Published var model: String? // nil = all models
-    @Published var mode = "provider" // breakdown: provider | model | day
+    @Published var project: String? // nil = all projects
+    @Published var mode = "provider" // breakdown: provider | model | project | day
+    @Published var contentHeight: CGFloat = 0 // measured panel content, for the popover's scroll cap
     var onUpdate: ((Report) -> Void)?
+    private let scanner = Scanner()
+    private let queue = DispatchQueue(label: "tokenmeter.scan", qos: .utility) // serializes scanner access
     func refresh() {
-        DispatchQueue.global(qos: .utility).async {
-            let r = Scanner.run()
+        queue.async {
+            let r = self.scanner.run()
             DispatchQueue.main.async { self.report = r; self.onUpdate?(r) }
         }
     }
@@ -197,14 +323,14 @@ func cap(_ s: String) -> some View {
         .lineLimit(1)
 }
 
-func bar(_ share: Double, _ color: Color = accent) -> some View {
+func bar(_ share: Double, _ color: Color = accent, height: CGFloat = 3) -> some View {
     GeometryReader { geo in
         ZStack(alignment: .leading) {
             Capsule().fill(Color.primary.opacity(0.1))
             Capsule().fill(color).frame(width: max(0, geo.size.width * min(share, 1)))
         }
     }
-    .frame(height: 3)
+    .frame(height: height)
 }
 
 /// Text tab with an underline when selected.
@@ -229,6 +355,11 @@ struct Card: ViewModifier {
 }
 extension View { func card() -> some View { modifier(Card()) } }
 
+struct HeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 struct WidgetView: View {
     @ObservedObject var store: Store
     let menu: NSMenu
@@ -248,6 +379,7 @@ struct WidgetView: View {
     func scoped(_ r: Report, _ from: Date, _ to: Date) -> [Entry] {
         r.entries(from: from, to: to).filter {
             (provider == nil || $0.provider == provider) && (store.model == nil || $0.model == store.model)
+                && (store.project == nil || $0.project == store.project)
         }
     }
     func sum(_ es: [Entry]) -> Row { es.reduce(into: Row()) { $0.add($1.row) } }
@@ -257,11 +389,26 @@ struct WidgetView: View {
         return providers.filter { seen.contains($0.name) }
     }
 
-    var body: some View {
+    /// In the popover, scroll once the content is taller than the screen allows.
+    @ViewBuilder var body: some View {
+        if inPopover {
+            let maxH = (NSScreen.main?.visibleFrame.height ?? 800) - 40
+            ScrollView(.vertical, showsIndicators: false) {
+                content.background(GeometryReader { Color.clear.preference(key: HeightKey.self, value: $0.size.height) })
+            }
+            .frame(width: 360, height: min(max(store.contentHeight, 120), maxH))
+            .onPreferenceChange(HeightKey.self) { store.contentHeight = $0 }
+        } else {
+            content
+        }
+    }
+
+    var content: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
             if let r = store.report {
                 filters(r)
+                if !r.quotas.isEmpty { quotas(r) }
                 hero(r)
                 activity(r)
                 breakdown(r)
@@ -300,6 +447,20 @@ struct WidgetView: View {
         HStack(spacing: 6) {
             chip("All", nil, .primary)
             ForEach(present, id: \.name) { chip($0.name, $0.name, $0.color) }
+            if let p = store.project {
+                Button { store.project = nil } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder")
+                        Text(p).lineLimit(1).truncationMode(.middle).frame(maxWidth: 70)
+                        Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(Capsule().fill(accent.opacity(0.16)))
+                    .overlay(Capsule().strokeBorder(accent.opacity(0.7), lineWidth: 1))
+                }
+                .buttonStyle(.plain).help("Project: \(p) — click to clear")
+            }
             Spacer(minLength: 4)
             modelPicker(r)
         }
@@ -337,6 +498,50 @@ struct WidgetView: View {
         .pickerStyle(.menu).labelsHidden().controlSize(.small).frame(maxWidth: 130)
     }
 
+    // MARK: plan limits
+
+    func quotaColor(_ pct: Double) -> Color { pct >= 90 ? .red : pct >= 70 ? .orange : accent }
+
+    /// Subscription windows as the tools last recorded them locally (no network).
+    func quotas(_ r: Report) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            cap("Plan limits")
+            ForEach(r.quotas) { q in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Text(q.product).font(.system(size: 12, weight: .medium))
+                        if let plan = q.plan {
+                            Text(plan.uppercased()).font(.system(size: 8.5, weight: .semibold)).tracking(0.6)
+                                .padding(.horizontal, 5).padding(.vertical, 1.5)
+                                .background(Capsule().fill(Color.primary.opacity(0.09))).foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        if let at = q.asOf, Date().timeIntervalSince(at) > 3600 {
+                            Text("as of \(relative(at))").font(.system(size: 9.5)).foregroundColor(.secondary)
+                        }
+                    }
+                    ForEach(q.meters) { m in
+                        VStack(spacing: 4) {
+                            HStack(spacing: 6) {
+                                Text(m.label).foregroundColor(.secondary)
+                                Spacer()
+                                if let reset = m.resetsAt {
+                                    Text("resets \(relative(reset))").foregroundColor(.secondary)
+                                }
+                                Text("\(Int(m.percent.rounded()))%").fontWeight(.semibold)
+                                    .foregroundColor(m.percent >= 70 ? quotaColor(m.percent) : .primary)
+                                    .frame(minWidth: 34, alignment: .trailing)
+                            }
+                            .font(.system(size: 10.5)).monospacedDigit()
+                            bar(m.percent / 100, quotaColor(m.percent), height: 4)
+                        }
+                    }
+                }
+            }
+        }
+        .card()
+    }
+
     // MARK: hero
 
     func hero(_ r: Report) -> some View {
@@ -358,7 +563,8 @@ struct WidgetView: View {
                 if prev.cost > 0.005 {
                     let pct = (cur.cost - prev.cost) / prev.cost * 100
                     let c: Color = pct >= 0 ? .orange : .green
-                    Text(String(format: "%@ %.0f%%", pct >= 0 ? "▲" : "▼", abs(pct)))
+                    Text(pct >= 200 ? String(format: "▲ %.0f×", cur.cost / prev.cost)
+                         : String(format: "%@ %.0f%%", pct >= 0 ? "▲" : "▼", abs(pct)))
                         .font(.system(size: 10, weight: .semibold)).monospacedDigit().foregroundColor(c)
                         .help("vs previous \(g.days == 1 ? "day" : "\(g.days) days")")
                 }
@@ -381,7 +587,8 @@ struct WidgetView: View {
     /// One sentence that says what the numbers mean.
     func insight(_ es: [Entry], _ cur: Row, _ days: Int) -> String {
         if cur.tokens == 0 { return "No usage in this period." }
-        var s = days > 1 ? "\(usd(cur.cost / Double(days))) a day." : "\(Int(cur.calls)) calls."
+        var s = days > 1 ? "\(usd(cur.cost / Double(days))) a day."
+            : cur.calls > 0 ? "\(usd(cur.cost / cur.calls)) per call." : ""
         if store.model == nil {
             let groups = Dictionary(grouping: es, by: { provider == nil ? $0.provider : $0.model })
                 .mapValues { $0.reduce(0) { $0 + $1.row.cost } }
@@ -489,30 +696,38 @@ struct WidgetView: View {
         let cur = sum(es)
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                cap("Breakdown")
-                Spacer()
+
                 tab("Provider", store.mode == "provider") { store.mode = "provider" }
                 tab("Model", store.mode == "model") { store.mode = "model" }
+                tab("Project", store.mode == "project") { store.mode = "project" }
                 tab("Day", store.mode == "day") { store.mode = "day" }
+                Spacer()
             }
             if es.isEmpty {
                 Text("No usage in this period").font(.caption).foregroundColor(.secondary)
             } else if store.mode == "day" {
                 days(r)
             } else {
-                let byProvider = store.mode == "provider"
-                let groups = Dictionary(grouping: es, by: { byProvider ? $0.provider : $0.model })
+                let byProvider = store.mode == "provider", byProject = store.mode == "project"
+                let groups = Dictionary(grouping: es, by: { byProvider ? $0.provider : byProject ? ($0.project.isEmpty ? "?" : $0.project) : $0.model })
                     .map { (key: $0.key, es: $0.value, row: sum($0.value)) }
                     .sorted { $0.row.cost > $1.row.cost }
-                ForEach(groups, id: \.key) { grp in
+                ForEach(Array(groups.prefix(8)), id: \.key) { grp in
                     Button {
-                        if byProvider { store.provider = grp.key; store.model = nil } else { store.model = grp.key }
+                        if byProvider { store.provider = grp.key; store.model = nil }
+                        else if byProject { store.project = grp.key == "?" ? nil : grp.key }
+                        else { store.model = grp.key }
                     } label: {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 6) {
-                                Circle().fill(providerColor(byProvider ? grp.key : providerOf(grp.key)))
-                                    .frame(width: 6, height: 6)
+                                if byProject {
+                                    Image(systemName: "folder").font(.system(size: 9)).foregroundColor(.secondary)
+                                } else {
+                                    Circle().fill(providerColor(byProvider ? grp.key : providerOf(grp.key)))
+                                        .frame(width: 6, height: 6)
+                                }
                                 Text(grp.key).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                                    .truncationMode(.middle).help(grp.key)
                                 Spacer()
                                 Text(tok(grp.row.tokens)).font(.system(size: 10.5)).foregroundColor(.secondary)
                                 Text(cur.cost > 0 ? String(format: "%.0f%%", grp.row.cost / cur.cost * 100) : "—")
@@ -527,6 +742,11 @@ struct WidgetView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                }
+                if groups.count > 8 {
+                    let rest = groups.dropFirst(8)
+                    Text("+\(rest.count) more · \(usd(rest.reduce(0) { $0 + $1.row.cost }))")
+                        .font(.system(size: 10.5)).foregroundColor(.secondary)
                 }
             }
         }
@@ -644,7 +864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         popover.behavior = .transient
         popover.appearance = NSAppearance(named: .darkAqua)
         store.onUpdate = { [weak self] r in
-            self?.statusItem.button?.title = usd(r.total(from: today(), to: today()).cost)
+            self?.setStatusTitle(r)
             self?.snapshotIfRequested()
         }
         // Any data or selection change can change the content height.
@@ -691,6 +911,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// Menu bar: today's cost, plus the fullest plan limit once one passes 80%.
+    func setStatusTitle(_ r: Report) {
+        var title = usd(r.total(from: today(), to: today()).cost)
+        var attrs: [NSAttributedString.Key: Any] = [:]
+        if let q = r.quotas.max(by: { $0.peak < $1.peak }), q.peak >= 80 {
+            title += " · \(q.product) \(Int(q.peak.rounded()))%"
+            attrs[.foregroundColor] = q.peak >= 90 ? NSColor.systemRed : NSColor.systemOrange
+        }
+        statusItem.button?.attributedTitle = NSAttributedString(string: title, attributes: attrs)
+    }
+
     /// Debug: `TokenMeter --snapshot out.png [today|week|month|dayN] [--popover]` renders the widget to a PNG and quits.
     func snapshotIfRequested() {
         let args = CommandLine.arguments
@@ -701,6 +932,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let t = args.first(where: { $0.hasPrefix("provider=") }) { store.provider = String(t.dropFirst(9)) }
         if let m = args.first(where: { $0.hasPrefix("model=") }) { store.model = String(m.dropFirst(6)) }
         if let m = args.first(where: { $0.hasPrefix("mode=") }) { store.mode = String(m.dropFirst(5)) }
+        if let m = args.first(where: { $0.hasPrefix("project=") }) { store.project = String(m.dropFirst(8)) }
         window.contentView?.layer?.backgroundColor = NSColor(white: 0.13, alpha: 1).cgColor
         if args.contains("--popover"), let blur = window.contentView {
             hosting.removeFromSuperview()
