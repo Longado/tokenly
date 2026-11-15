@@ -36,12 +36,11 @@ TOTAL                      2,001,200     370,000    48,000,000     900,000    51
 `TokenMeter.app` is a native, dependency-free macOS menu bar app (13+). The menu bar shows
 today's cost; click it for the usage panel, right-click for the menu. It refreshes every 5 minutes and on wake.
 
-- Provider filter (All / Anthropic / OpenAI / Google, derived from the model name) — every number, the chart and the breakdown follow it. Tools (Claude Code, Codex) are just where the logs come from.
-- Range switch: Today / 7D / 30D, with change vs the previous period.
-- 30-day daily cost chart (stacked by provider, dashed daily average); click a bar to see that day.
-- Stat tiles: average per day, peak day, cache hit rate, money saved by cache reads.
-- Model dropdown, grouped by provider: pick one model to filter the whole panel and see its token mix (input / output / cache read / cache write).
-- Breakdown by provider (click to filter) or, with a provider selected, by model (click to select).
+- Hero: cost for the range, change vs the previous period, a one-line takeaway
+  ("$0.79 a day. Anthropic took 94% of it."), and the token mix (input / output / cached / cache writes).
+- Filters: provider (All / Anthropic / OpenAI / Google, derived from the model name) and a model dropdown grouped by provider.
+- Activity: 13-week dot calendar (dot size = cost that day; click a dot to focus that day), plus 7-day / 30-day / daily-average totals.
+- Breakdown by provider (with per-model split), by model, or a daily table.
 - Optional desktop widget (menu → Show on Desktop); drag its header to move it.
 - Menu: Refresh, Show on Desktop, Launch at Login, Quit.
 
@@ -53,7 +52,7 @@ macos/build.sh            # -> macos/build/TokenMeter.app
 cp -R macos/build/TokenMeter.app /Applications/
 ```
 
-`TokenMeter --snapshot out.png [today|week|month|dayN] [--popover] [provider=OpenAI] [model=gpt-6.1-sol]` renders the panel to a PNG (for development).
+`TokenMeter --snapshot out.png [today|week|month|dayN] [--popover] [provider=OpenAI] [model=gpt-6.1-sol] [mode=provider|model|day]` renders the panel to a PNG (for development).
 
 Prices are in `macos/main.swift` (`prices`) and `tokenmeter.py` (`PRICES`); keep them in sync.
 
