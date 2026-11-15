@@ -528,6 +528,7 @@ final class Prefs: ObservableObject {
     @Published var showLimits: Bool { didSet { ud.set(showLimits, forKey: "showLimits") } }
     @Published var showLimitDetails: Bool { didSet { ud.set(showLimitDetails, forKey: "showLimitDetails") } }
     @Published var showPeriodStats: Bool { didSet { ud.set(showPeriodStats, forKey: "showPeriodStats") } }
+    @Published var splitByProvider: Bool { didSet { ud.set(splitByProvider, forKey: "splitByProvider") } }
     /// Panel unfolded: Overview plus Breakdown and History on one scrolling page.
     @Published var expanded: Bool { didSet { ud.set(expanded, forKey: "expanded") } }
     /// Color the menu bar text orange/red at the plan-limit alert (off: plain text).
@@ -565,6 +566,7 @@ final class Prefs: ObservableObject {
         showLimits = ud.object(forKey: "showLimits") as? Bool ?? true
         showLimitDetails = ud.object(forKey: "showLimitDetails") as? Bool ?? false
         showPeriodStats = ud.object(forKey: "showPeriodStats") as? Bool ?? false
+        splitByProvider = ud.object(forKey: "splitByProvider") as? Bool ?? true
         colorMenuBar = ud.object(forKey: "colorMenuBar") as? Bool ?? false
         expanded = ud.bool(forKey: "expanded")
         launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -774,7 +776,7 @@ struct WidgetView: View {
     var header: some View {
         HStack(spacing: 7) {
             HStack(spacing: 5) {
-                Image(systemName: "chart.bar.fill").foregroundColor(accent)
+                Image(nsImage: logoImage(points: fs(16), template: false)).interpolation(.none)
                 Text("TOKENLY").font(.system(size: fs(11), weight: .semibold).width(.expanded)).tracking(0.8)
                     .fixedSize()
             }
@@ -1108,10 +1110,21 @@ struct WidgetView: View {
         }
         var slots = Array(repeating: Row(), count: n)
         var active = Array(repeating: Set<Int>(), count: n)
+        var byProvider = Array(repeating: [String: Row](), count: n)
         for e in scoped(r, g.from, g.to) {
             let i = g.hourly ? Int(e.hour.timeIntervalSince(g.from) / 3600)
                 : cal.dateComponents([g.unit], from: g.from, to: e.day).value(for: g.unit) ?? -1
-            if i >= 0 && i < n { slots[i].add(e.row); active[i].formUnion(e.slots) }
+            if i >= 0 && i < n {
+                slots[i].add(e.row); active[i].formUnion(e.slots)
+                byProvider[i][e.provider, default: Row()].add(e.row)
+            }
+        }
+        // Split bars by provider (cost or tokens), in the fixed provider order, when more than one is in view.
+        let inView = providers.filter { p in byProvider.contains { $0[p.name] != nil } }
+        let stacked = prefs.splitByProvider && store.metric != "time" && inView.count > 1
+        let part: (Int, String) -> Double = { i, p in
+            let row = byProvider[i][p] ?? Row()
+            return store.metric == "tokens" ? row.tokens : row.cost
         }
         let value: (Int) -> Double = { i in
             store.metric == "tokens" ? slots[i].tokens : store.metric == "time" ? Double(active[i].count) * slotSeconds : slots[i].cost
@@ -1139,11 +1152,23 @@ struct WidgetView: View {
                 HStack(alignment: .bottom, spacing: n > 40 ? 1 : 2) {
                     ForEach(0..<n, id: \.self) { i in
                         let v = value(i)
-                        RoundedRectangle(cornerRadius: 1.5)
-                            .fill(v > 0 ? accent : Color.primary.opacity(0.15))
-                            .frame(height: v > 0 && maxV > 0 ? max(2, geo.size.height * v / maxV) : 2)
-                            .opacity(hi == nil || hi == i ? 1 : 0.4)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                        Group {
+                            if stacked && v > 0 && maxV > 0 {
+                                VStack(spacing: 0) {
+                                    ForEach(inView.reversed(), id: \.name) { p in
+                                        let pv = part(i, p.name)
+                                        if pv > 0 { Rectangle().fill(p.color).frame(height: geo.size.height * pv / maxV) }
+                                    }
+                                }
+                                .clipShape(RoundedRectangle(cornerRadius: 1.5))
+                            } else {
+                                RoundedRectangle(cornerRadius: 1.5)
+                                    .fill(v > 0 ? accent : Color.primary.opacity(0.15))
+                                    .frame(height: v > 0 && maxV > 0 ? max(2, geo.size.height * v / maxV) : 2)
+                            }
+                        }
+                        .opacity(hi == nil || hi == i ? 1 : 0.4)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     }
                 }
                 .contentShape(Rectangle())
@@ -1166,6 +1191,19 @@ struct WidgetView: View {
                 Text(label(n - 1))
             }
             .font(.system(size: fs(8.5))).foregroundColor(.secondary)
+            if stacked {
+                // Legend; while hovering it shows each provider's share of that bar.
+                HStack(spacing: 10) {
+                    ForEach(inView, id: \.name) { p in
+                        HStack(spacing: 4) {
+                            Circle().fill(p.color).frame(width: fs(6), height: fs(6))
+                            Text(hi.map { fmt(part($0, p.name)) } ?? p.name)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .font(.system(size: fs(9.5))).foregroundColor(.secondary).lineLimit(1)
+            }
         }
     }
 
@@ -1458,6 +1496,7 @@ struct SettingsView: View {
                 Toggle("One-line summary", isOn: $prefs.showInsight)
                 Toggle("Tokens, calls and active time", isOn: $prefs.showDetails)
                 Toggle("Trend chart", isOn: $prefs.showTrend)
+                Toggle("Split chart by provider", isOn: $prefs.splitByProvider)
                 Toggle("Plan limits", isOn: $prefs.showLimits)
                 Toggle("Plan limit pace and reset details", isOn: $prefs.showLimitDetails)
                 Toggle("Period stats (active days, busiest day, cache saved)", isOn: $prefs.showPeriodStats)
@@ -1488,6 +1527,93 @@ struct SettingsView: View {
         .frame(width: 440)
         .fixedSize(horizontal: false, vertical: true)
     }
+}
+
+// MARK: - Logo
+
+/// 16×16 pixel-art token: o outline, v body, d shade, l highlight, w the "T".
+let logoPixels = [
+    "................",
+    ".....oooooo.....",
+    "...oovvvvvvoo...",
+    "..ovvllvvvvvvo..",
+    "..ovlvvvvvvvvo..",
+    ".ovvwwwwwwwwvvo.",
+    ".ovvwwwwwwwwvvo.",
+    ".ovvvvvwwvvvvvo.",
+    ".ovvvvvwwvvvvvo.",
+    ".ovvvvvwwvvvvvo.",
+    ".ovvvvvwwvvvvdo.",
+    "..ovvvvwwvvvdo..",
+    "..ovvvvwwvvddo..",
+    "...oovvvvvddo...",
+    ".....oooooo.....",
+    "................",
+]
+let logoColors: [Character: NSColor] = [
+    "o": NSColor(red: 0.16, green: 0.13, blue: 0.25, alpha: 1),
+    "v": NSColor(red: 0.67, green: 0.58, blue: 1.0, alpha: 1),
+    "d": NSColor(red: 0.49, green: 0.41, blue: 0.84, alpha: 1),
+    "l": NSColor(red: 0.89, green: 0.86, blue: 1.0, alpha: 1),
+    "w": NSColor.white,
+]
+
+/// Draws the pixel logo with hard edges into a `px`-pixel square, optionally on the app-icon tile.
+func drawLogo(px: CGFloat, template: Bool = false, tile: Bool = false) {
+    let ctx = NSGraphicsContext.current
+    ctx?.imageInterpolation = .none
+    ctx?.shouldAntialias = false
+    var inset: CGFloat = 0
+    if tile {
+        ctx?.shouldAntialias = true
+        let r = NSRect(x: px * 0.1, y: px * 0.1, width: px * 0.8, height: px * 0.8)
+        NSColor(red: 0.08, green: 0.08, blue: 0.11, alpha: 1).setFill()
+        NSBezierPath(roundedRect: r, xRadius: px * 0.18, yRadius: px * 0.18).fill()
+        ctx?.shouldAntialias = false
+        inset = px * 0.18
+    }
+    let cell = ((px - 2 * inset) / 16).rounded(.down)
+    let origin = (px - cell * 16) / 2
+    for (row, line) in logoPixels.enumerated() {
+        for (col, ch) in line.enumerated() {
+            // Template (menu bar): only the ring and the T, so it reads as an outline icon.
+            guard let color = template ? (ch == "o" || ch == "w" ? NSColor.black : nil) : logoColors[ch] else { continue }
+            color.setFill()
+            NSRect(x: origin + CGFloat(col) * cell, y: origin + CGFloat(15 - row) * cell, width: cell, height: cell).fill()
+        }
+    }
+}
+
+func logoImage(points: CGFloat, template: Bool) -> NSImage {
+    let img = NSImage(size: NSSize(width: points, height: points), flipped: false) { _ in
+        drawLogo(px: points, template: template)
+        return true
+    }
+    img.isTemplate = template
+    return img
+}
+
+/// `Tokenly --make-iconset dir` writes the app icon PNGs that build.sh turns into Tokenly.icns.
+func makeIconsetIfRequested() {
+    let args = CommandLine.arguments
+    guard let i = args.firstIndex(of: "--make-iconset"), i + 1 < args.count else { return }
+    let dir = URL(fileURLWithPath: args[i + 1])
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    for base in [16, 32, 128, 256, 512] {
+        for scale in [1, 2] {
+            let px = base * scale
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px, bitsPerSample: 8,
+                                             samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                             colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { continue }
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            drawLogo(px: CGFloat(px), tile: true)
+            NSGraphicsContext.restoreGraphicsState()
+            let name = "icon_\(base)x\(base)\(scale == 2 ? "@2x" : "").png"
+            try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent(name))
+        }
+    }
+    exit(0)
 }
 
 // MARK: - Window helpers
@@ -1539,7 +1665,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildWindow()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "TM"
-        statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "Tokenly")
+        statusItem.button?.image = logoImage(points: 16, template: true)
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusClicked)
@@ -1635,7 +1761,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // Two small lines in one status item, drawn by SwiftUI (clicks pass through to the button).
             let top = usd(t.cost) + (title.contains("%") ? " · \(Int((q?.peak ?? 0).rounded()))%" : "")
             let view = AnyView(HStack(spacing: 3) {
-                Image(systemName: "chart.bar.fill").font(.system(size: 11))
+                Image(nsImage: logoImage(points: 16, template: true)).renderingMode(.template)
                 VStack(alignment: .leading, spacing: -2) {
                     Text(top).font(.system(size: 9.5, weight: .semibold).monospacedDigit())
                         .foregroundColor(alert.map { Color(nsColor: $0) } ?? .primary)
@@ -1658,7 +1784,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stackedView?.removeFromSuperview()
         stackedView = nil
         statusItem.length = NSStatusItem.variableLength
-        button.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "Tokenly")
+        button.image = logoImage(points: 16, template: true)
         button.attributedTitle = NSAttributedString(string: title, attributes: attrs)
     }
 
@@ -1812,6 +1938,7 @@ func migrateFromTokenMeter() {
     ud.set(true, forKey: "migratedFromTokenMeter")
 }
 
+makeIconsetIfRequested()
 migrateFromTokenMeter()
 let app = NSApplication.shared
 let delegate = AppDelegate()

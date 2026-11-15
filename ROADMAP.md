@@ -25,6 +25,12 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.20.0 — provider-split charts and a logo
+- **Provider split.** Trend bars stack by provider in the provider colors, in cost or token mode, with a legend. While hovering, the legend shows each provider's value for that bar. Time mode stays one color, because active time can't be split. Settings → Overview shows → "Split chart by provider".
+- **Logo.** A 16×16 pixel-art token (violet coin with a pixel "T").
+  - The app draws it itself: the app icon (`Tokenly --make-iconset`, turned into `Tokenly.icns` by build.sh), a black-and-white menu bar icon (ring and T only), and the panel header.
+  - `docs/logo.png` is used in the README.
+
 ### v0.18.0 — fold / unfold instead of pages
 The Overview / Breakdown / History tabs are replaced by one fold control. Folded (the default) shows only the overview. "Show all" at the bottom, or the chevron in the header, unfolds Breakdown and History below it on one scrolling page, with section labels. The state is remembered.
 

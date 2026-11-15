@@ -1,3 +1,5 @@
+<img src="docs/logo.png" width="96" alt="Tokenly logo">
+
 # Tokenly
 
 Local token usage and API-equivalent cost for **Claude Code** and **Codex CLI**.
@@ -47,6 +49,7 @@ today's cost; click it for the usage panel, right-click for the menu. It refresh
   downloads your account's usage from vibecafe.ai (read-only, with the key Vibe Usage stored) back to your first
   synced day. Adds a Devices switch (All / This Mac / one device), a Device breakdown and the All range with monthly
   bars. This Mac's numbers still come from its own logs; other devices report daily totals.
+- Trend chart split by provider (Anthropic / OpenAI / Google / Other) with a legend; hover shows each share.
 - Ranges: period pills Today / 24H / 7D / 30D / 90D / All / Custom (From–To dates), or click any day. Today, 24H and single days chart by hour.
 - Trend strip under the headline number: hover a bar for its cost and tokens, click a day bar to focus it.
 - Active time: 5-minute slots with at least one model call.

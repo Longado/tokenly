@@ -11,6 +11,11 @@ for arch in arm64 x86_64; do
 done
 lipo -create build/Tokenly-arm64 build/Tokenly-x86_64 -output "$APP/Contents/MacOS/Tokenly"
 rm build/Tokenly-arm64 build/Tokenly-x86_64
+# App icon: the binary renders its own pixel logo.
+mkdir -p "$APP/Contents/Resources"
+"$APP/Contents/MacOS/Tokenly" --make-iconset build/Tokenly.iconset
+iconutil -c icns build/Tokenly.iconset -o "$APP/Contents/Resources/Tokenly.icns"
+rm -rf build/Tokenly.iconset
 codesign --force --sign - "$APP"
 ditto -c -k --keepParent "$APP" build/Tokenly.zip
 echo "Built $APP and build/Tokenly.zip"
