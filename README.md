@@ -36,9 +36,11 @@ TOTAL                      2,001,200     370,000    48,000,000     900,000    51
 `TokenMeter.app` is a native, dependency-free macOS menu bar app (13+). The menu bar shows
 today's cost; click it for the usage panel, right-click for the menu. It refreshes every 5 minutes and on wake.
 
-- Range switch: Today / 7 Days / 30 Days, with change vs the previous period and money saved by cache reads.
-- 30-day daily cost chart, stacked by tool; click a bar to see that day.
-- Breakdown by tool (Claude Code, Codex) and by model.
+- Tool filter: All / Claude Code / Codex — every number, the chart and the breakdown follow it.
+- Range switch: Today / 7D / 30D, with change vs the previous period.
+- 30-day daily cost chart (stacked by tool, dashed daily average); click a bar to see that day.
+- Stat tiles: average per day, peak day, cache hit rate, money saved by cache reads.
+- Breakdown by tool (click a tool to filter) or, with a tool selected, by model.
 - Optional desktop widget (menu → Show on Desktop); drag its header to move it.
 - Menu: Refresh, Show on Desktop, Launch at Login, Quit.
 
@@ -50,7 +52,7 @@ macos/build.sh            # -> macos/build/TokenMeter.app
 cp -R macos/build/TokenMeter.app /Applications/
 ```
 
-`TokenMeter --snapshot out.png [today|week|month|dayN] [--popover]` renders the panel to a PNG (for development).
+`TokenMeter --snapshot out.png [today|week|month|dayN] [--popover] [tool=Codex]` renders the panel to a PNG (for development).
 
 Prices are in `macos/main.swift` (`prices`) and `tokenmeter.py` (`PRICES`); keep them in sync.
 

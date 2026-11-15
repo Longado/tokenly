@@ -29,11 +29,11 @@ func toolColor(_ t: String) -> Color { tools.first { $0.name == t }?.color ?? .g
 // MARK: - Data
 
 struct Row {
-    var input = 0.0, output = 0.0, cacheRead = 0.0, cacheWrite = 0.0, cost = 0.0, saved = 0.0
+    var input = 0.0, output = 0.0, cacheRead = 0.0, cacheWrite = 0.0, cost = 0.0, saved = 0.0, calls = 0.0
     var tokens: Double { input + output + cacheRead + cacheWrite }
     mutating func add(_ r: Row) {
         input += r.input; output += r.output; cacheRead += r.cacheRead
-        cacheWrite += r.cacheWrite; cost += r.cost; saved += r.saved
+        cacheWrite += r.cacheWrite; cost += r.cost; saved += r.saved; calls += r.calls
     }
 }
 
@@ -77,7 +77,7 @@ final class Scanner {
         let p = prices[model] ?? [0, 0, 0, 0, 0]
         if prices[model] == nil { unpriced.insert(model) }
         let cost = (i * p[0] + o * p[1] + cr * p[2] + (cw - cw1h) * p[3] + cw1h * p[4]) / 1e6
-        let r = Row(input: i, output: o, cacheRead: cr, cacheWrite: cw, cost: cost, saved: cr * (p[0] - p[2]) / 1e6)
+        let r = Row(input: i, output: o, cacheRead: cr, cacheWrite: cw, cost: cost, saved: cr * (p[0] - p[2]) / 1e6, calls: 1)
         let day = cal.startOfDay(for: date)
         let key = "\(day.timeIntervalSince1970)|\(tool)|\(model)"
         buckets[key, default: Entry(day: day, tool: tool, model: model, row: Row())].row.add(r)
@@ -158,6 +158,7 @@ final class Store: ObservableObject {
     @Published var report: Report?
     @Published var preset = Preset.today
     @Published var pickedDay: Date?
+    @Published var tool: String? // nil = all tools
     var onUpdate: ((Report) -> Void)?
     func refresh() {
         DispatchQueue.global(qos: .utility).async {
@@ -170,111 +171,146 @@ final class Store: ObservableObject {
 // MARK: - Widget UI
 
 enum Preset: String, CaseIterable, Identifiable {
-    case today = "Today", week = "7 Days", month = "30 Days"
+    case today = "Today", week = "7D", month = "30D"
     var id: String { rawValue }
     var days: Int { self == .today ? 1 : self == .week ? 7 : 30 }
+    var title: String { self == .today ? "Today" : self == .week ? "Last 7 days" : "Last 30 days" }
 }
 
 struct WidgetView: View {
     @ObservedObject var store: Store
     let menu: NSMenu
     var inPopover = false
-    var preset: Preset { store.preset }
+
     var pickedDay: Date? { store.pickedDay }
+    var tool: String? { store.tool }
 
     /// Selected range: a clicked day, or the preset ending today.
     var range: (from: Date, to: Date, days: Int, title: String) {
-        if let d = pickedDay { return (d, d, 1, dayLabel(d)) }
-        return (daysAgo(preset.days - 1), today(), preset.days, preset.rawValue)
+        if let d = pickedDay { return (d, d, 1, d.formatted(.dateTime.weekday(.wide).month(.abbreviated).day())) }
+        return (daysAgo(store.preset.days - 1), today(), store.preset.days, store.preset.title)
     }
 
+    /// Entries in [from, to] for the selected tool (all tools when nil).
+    func scoped(_ r: Report, _ from: Date, _ to: Date) -> [Entry] {
+        r.entries(from: from, to: to).filter { tool == nil || $0.tool == tool }
+    }
+    func sum(_ es: [Entry]) -> Row { es.reduce(into: Row()) { $0.add($1.row) } }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
             header
+            toolChips
             if let r = store.report {
-                Picker("", selection: Binding(get: { preset }, set: { store.preset = $0; store.pickedDay = nil })) {
-                    ForEach(Preset.allCases) { Text($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.segmented).labelsHidden()
-                .opacity(pickedDay == nil ? 1 : 0.45) // a clicked day overrides the preset
-                summary(r)
+                hero(r)
                 chart(r)
+                stats(r)
                 breakdown(r)
                 if !r.unpriced.isEmpty {
-                    Text("No price for: \(r.unpriced.sorted().joined(separator: ", "))")
+                    Label("No price for \(r.unpriced.sorted().joined(separator: ", "))", systemImage: "exclamationmark.triangle")
                         .font(.caption2).foregroundColor(.orange)
                 }
             } else {
-                Text("Scanning…").font(.caption).foregroundColor(.secondary)
+                Text("Scanning logs…").font(.caption).foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 120)
             }
+            Divider().opacity(0.5)
+            footer
         }
-        .padding(16)
-        .frame(width: 340)
+        .padding(18)
+        .frame(width: 360)
     }
 
     var header: some View {
-        HStack {
-            Text("TokenMeter").fontWeight(.semibold)
+        HStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "chart.bar.fill").foregroundColor(tool.map(toolColor) ?? .accentColor)
+                Text("TokenMeter").font(.system(size: 13, weight: .semibold))
+            }
+            .contentShape(Rectangle())
+            .overlay(inPopover ? nil : DragHandle(menu: menu)) // desktop: drag to move, right-click for menu
             Spacer()
-            if let r = store.report {
-                Text("Updated \(r.updated.formatted(date: .omitted, time: .shortened))")
-                    .padding(.trailing, inPopover ? 44 : 0)
+            Picker("", selection: Binding(get: { store.preset }, set: { store.preset = $0; store.pickedDay = nil })) {
+                ForEach(Preset.allCases) { Text($0.rawValue).tag($0) }
             }
-        }
-        .font(.caption).foregroundColor(.secondary)
-        .contentShape(Rectangle())
-        .overlay(inPopover ? nil : DragHandle(menu: menu)) // drag to move, right-click for menu
-        .overlay(alignment: .trailing) {
-            if inPopover {
-                HStack(spacing: 2) {
-                    Spacer()
-                    Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }
-                    Button { menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) } label: {
-                        Image(systemName: "ellipsis.circle")
-                    }
-                }
-                .buttonStyle(.borderless)
-                .background(Color.clear)
-            }
+            .pickerStyle(.segmented).labelsHidden().controlSize(.small).frame(width: 150)
+            .opacity(pickedDay == nil ? 1 : 0.45) // a clicked day overrides the preset
         }
     }
 
-    func summary(_ r: Report) -> some View {
+    var toolChips: some View {
+        HStack(spacing: 6) {
+            chip("All", nil, .primary)
+            ForEach(tools, id: \.name) { chip($0.name, $0.name, $0.color) }
+            Spacer()
+        }
+    }
+
+    func chip(_ label: String, _ value: String?, _ color: Color) -> some View {
+        let on = store.tool == value
+        return Button { store.tool = value } label: {
+            HStack(spacing: 5) {
+                if value != nil { Circle().fill(color).frame(width: 6, height: 6) }
+                Text(label)
+            }
+            .font(.system(size: 11, weight: .medium))
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(Capsule().fill(on ? color.opacity(value == nil ? 0.15 : 0.22) : Color.primary.opacity(0.05)))
+            .overlay(Capsule().strokeBorder(on ? color.opacity(0.55) : Color.clear, lineWidth: 1))
+            .foregroundColor(on ? .primary : .secondary)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    func hero(_ r: Report) -> some View {
         let g = range
-        let cur = r.total(from: g.from, to: g.to)
-        let prevTo = cal.date(byAdding: .day, value: -g.days, to: g.to)!
-        let prev = r.total(from: cal.date(byAdding: .day, value: -g.days, to: g.from)!, to: prevTo)
+        let cur = sum(scoped(r, g.from, g.to))
+        let prevFrom = cal.date(byAdding: .day, value: -g.days, to: g.from)!
+        let prev = sum(scoped(r, prevFrom, cal.date(byAdding: .day, value: -1, to: g.from)!))
         return VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(usd(cur.cost)).font(.system(size: 30, weight: .semibold, design: .rounded))
-                Text(g.title).font(.caption).foregroundColor(.secondary)
+            HStack {
+                Text(g.title.uppercased()).font(.system(size: 10, weight: .semibold)).tracking(0.8)
+                    .foregroundColor(.secondary)
                 Spacer()
                 if pickedDay != nil {
-                    Button("Clear") { store.pickedDay = nil }.buttonStyle(.link).font(.caption)
+                    Button("Back to \(store.preset.title)") { store.pickedDay = nil }
+                        .buttonStyle(.link).font(.caption2)
                 }
             }
-            HStack(spacing: 10) {
-                Text("\(tok(cur.tokens)) tokens")
-                if prev.cost > 0 {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(usd(cur.cost)).font(.system(size: 34, weight: .bold, design: .rounded)).monospacedDigit()
+                if prev.cost > 0.005 {
                     let pct = (cur.cost - prev.cost) / prev.cost * 100
-                    Text(String(format: "%@ %.0f%% vs prev", pct >= 0 ? "▲" : "▼", abs(pct)))
-                        .foregroundColor(pct >= 0 ? .orange : .green)
+                    let c: Color = pct >= 0 ? .orange : .green
+                    Text(String(format: "%@ %.0f%%", pct >= 0 ? "▲" : "▼", abs(pct)))
+                        .font(.system(size: 10, weight: .semibold)).monospacedDigit()
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(c.opacity(0.18))).foregroundColor(c)
+                        .help("vs previous \(g.days == 1 ? "day" : "\(g.days) days")")
                 }
-                if cur.saved > 0 { Text("cache saved \(usd(cur.saved))") }
             }
-            .font(.caption).foregroundColor(.secondary)
+            Text("\(tok(cur.tokens)) tokens · \(Int(cur.calls)) calls")
+                .font(.caption).foregroundColor(.secondary).monospacedDigit()
         }
     }
 
     func chart(_ r: Report) -> some View {
         let from = daysAgo(chartDays - 1)
-        let data = r.entries(from: from, to: today())
+        let data = scoped(r, from, today())
         let g = range
+        let avg = g.days > 1 ? sum(scoped(r, g.from, g.to)).cost / Double(g.days) : 0
         return Chart {
             ForEach(Array(data.enumerated()), id: \.offset) { _, e in
                 BarMark(x: .value("Day", e.day, unit: .day), y: .value("Cost", e.row.cost))
                     .foregroundStyle(by: .value("Tool", e.tool))
-                    .opacity(e.day >= g.from && e.day <= g.to ? 1 : 0.35)
+                    .cornerRadius(2.5)
+                    .opacity(e.day >= g.from && e.day <= g.to ? 1 : 0.3)
+            }
+            if avg > 0 {
+                RuleMark(y: .value("Avg", avg))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .foregroundStyle(Color.secondary)
             }
         }
         .chartForegroundStyleScale(domain: tools.map { $0.name }, range: tools.map { $0.color })
@@ -286,8 +322,8 @@ struct WidgetView: View {
         }
         .chartYAxis {
             AxisMarks(position: .trailing, values: .automatic(desiredCount: 3)) { v in
-                AxisGridLine()
-                AxisValueLabel { if let d = v.as(Double.self) { Text(usd(d)) } }
+                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5)).foregroundStyle(Color.primary.opacity(0.12))
+                AxisValueLabel { if let d = v.as(Double.self) { Text(d == 0 ? "0" : "$\(Int(d))") } }
             }
         }
         .chartLegend(.hidden)
@@ -303,53 +339,96 @@ struct WidgetView: View {
                     }
             }
         }
-        .frame(height: 90)
-        .font(.caption2)
+        .frame(height: 96)
+        .font(.system(size: 9))
+    }
+
+    func stats(_ r: Report) -> some View {
+        let g = range
+        let es = scoped(r, g.from, g.to)
+        let cur = sum(es)
+        let daily = Dictionary(grouping: es, by: { $0.day }).mapValues { $0.reduce(0) { $0 + $1.row.cost } }
+        let peak = daily.max { $0.value < $1.value }
+        let inputSide = cur.input + cur.cacheRead + cur.cacheWrite
+        return HStack(spacing: 6) {
+            tile("Avg / day", usd(cur.cost / Double(g.days)))
+            tile("Peak day", peak.map { usd($0.value) } ?? "—", peak.map { dayLabel($0.key) })
+            tile("Cache hit", inputSide > 0 ? String(format: "%.0f%%", cur.cacheRead / inputSide * 100) : "—")
+            tile("Cache saved", usd(cur.saved))
+        }
+    }
+
+    func tile(_ label: String, _ value: String, _ sub: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.system(size: 9.5, weight: .medium)).foregroundColor(.secondary)
+            Text(value).font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
+                .lineLimit(1).minimumScaleFactor(0.7)
+            Text(sub ?? " ").font(.system(size: 9)).foregroundColor(.secondary) // keeps tiles equal height
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8).padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.06)))
     }
 
     func breakdown(_ r: Report) -> some View {
         let g = range
-        let es = r.entries(from: g.from, to: g.to)
-        let total = es.reduce(0) { $0 + $1.row.cost }
+        let es = scoped(r, g.from, g.to)
+        let total = sum(es).cost
+        // All tools: one row per tool (click to filter). One tool: one row per model.
+        let rows: [(name: String, color: Color, row: Row, tool: String?)] = tool == nil
+            ? tools.map { t in (t.name, t.color, sum(es.filter { $0.tool == t.name }), t.name) }
+            : Dictionary(grouping: es, by: { $0.model })
+                .map { ($0.key, toolColor(tool!), sum($0.value), nil as String?) }
+                .sorted { $0.row.cost > $1.row.cost }
         return VStack(alignment: .leading, spacing: 10) {
-            ForEach(tools, id: \.name) { t in
-                let te = es.filter { $0.tool == t.name }
-                let row = te.reduce(into: Row()) { $0.add($1.row) }
-                let models = Dictionary(grouping: te, by: { $0.model })
-                    .map { ($0.key, $0.value.reduce(into: Row()) { $0.add($1.row) }) }
-                    .sorted { $0.1.cost > $1.1.cost }
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Circle().fill(t.color).frame(width: 8, height: 8)
-                        Text(t.name).fontWeight(.medium)
-                        Spacer()
-                        Text(tok(row.tokens)).foregroundColor(.secondary)
-                        Text(usd(row.cost)).frame(minWidth: 56, alignment: .trailing)
-                    }
-                    .font(.callout)
-                    GeometryReader { geo in
-                        ZStack(alignment: .leading) {
-                            Capsule().fill(Color.primary.opacity(0.1))
-                            Capsule().fill(t.color)
-                                .frame(width: geo.size.width * (total > 0 ? row.cost / total : 0))
-                        }
-                    }
-                    .frame(height: 4)
-                    ForEach(models, id: \.0) { m in
-                        HStack {
-                            Text(m.0).lineLimit(1)
+            Text(tool == nil ? "BY TOOL" : "BY MODEL").font(.system(size: 10, weight: .semibold)).tracking(0.8)
+                .foregroundColor(.secondary)
+            if rows.isEmpty {
+                Text("No usage in this period").font(.caption).foregroundColor(.secondary)
+            }
+            ForEach(rows, id: \.name) { item in
+                Button { if let t = item.tool { store.tool = t } } label: {
+                    VStack(spacing: 5) {
+                        HStack(spacing: 6) {
+                            if item.tool != nil { Circle().fill(item.color).frame(width: 7, height: 7) }
+                            Text(item.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
                             Spacer()
-                            Text(tok(m.1.tokens))
-                            Text(r.unpriced.contains(m.0) ? "—" : usd(m.1.cost)).frame(minWidth: 56, alignment: .trailing)
+                            Text(tok(item.row.tokens)).font(.caption).foregroundColor(.secondary).monospacedDigit()
+                            Text(r.unpriced.contains(item.name) ? "—" : usd(item.row.cost))
+                                .font(.system(size: 12, weight: .semibold, design: .rounded)).monospacedDigit()
+                                .frame(minWidth: 58, alignment: .trailing)
                         }
-                        .font(.caption).foregroundColor(.secondary).padding(.leading, 16)
+                        GeometryReader { geo in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.primary.opacity(0.08))
+                                Capsule().fill(item.color)
+                                    .frame(width: max(0, geo.size.width * (total > 0 ? item.row.cost / total : 0)))
+                            }
+                        }
+                        .frame(height: 4)
                     }
-                    if te.isEmpty {
-                        Text("No usage").font(.caption).foregroundColor(.secondary).padding(.leading, 16)
-                    }
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
             }
         }
+    }
+
+    var footer: some View {
+        HStack(spacing: 4) {
+            if let r = store.report {
+                Text("Updated \(r.updated.formatted(date: .omitted, time: .shortened)) · local logs only")
+            }
+            Spacer()
+            if inPopover {
+                Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }.help("Refresh")
+                Button { menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) } label: {
+                    Image(systemName: "ellipsis.circle")
+                }.help("More")
+            }
+        }
+        .font(.caption2).foregroundColor(.secondary)
+        .buttonStyle(.borderless)
     }
 }
 
@@ -392,6 +471,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildWindow()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "TM"
+        statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "TokenMeter")
+        statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusClicked)
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -454,6 +535,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mode = i + 2 < args.count ? args[i + 2] : "today"
         if mode.hasPrefix("day"), let n = Int(mode.dropFirst(3)) { store.pickedDay = daysAgo(n) }
         else { store.preset = mode == "week" ? .week : mode == "month" ? .month : .today }
+        if let t = args.first(where: { $0.hasPrefix("tool=") }) { store.tool = String(t.dropFirst(5)) }
         window.contentView?.layer?.backgroundColor = NSColor(white: 0.13, alpha: 1).cgColor
         if args.contains("--popover"), let blur = window.contentView {
             hosting.removeFromSuperview()
