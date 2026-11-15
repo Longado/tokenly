@@ -1,4 +1,4 @@
-// TokenMeter.app: menu bar panel (and optional desktop widget) showing local token usage,
+// Tokenly.app: menu bar panel (and optional desktop widget) showing local token usage,
 // API-equivalent cost and subscription limits for Claude Code and Codex CLI. Reads local files only.
 import AppKit
 import Combine
@@ -12,7 +12,7 @@ let slotSeconds: TimeInterval = 300 // active time = 5-minute slots with at leas
 // MARK: - Pricing
 
 // USD per 1M tokens: input, output, cache_read, cache_write_5m, cache_write_1h.
-// Keep in sync with PRICES in tokenmeter.py (tests/test_prices.py checks this).
+// Keep in sync with PRICES in tokenly.py (tests/test_prices.py checks this).
 let defaultPrices: [String: [Double]] = [
     "claude-fable-5-2": [8, 40, 0.20, 10, 16],
     "claude-opus-5-5": [4, 20, 0.20, 5, 8],
@@ -22,7 +22,7 @@ let defaultPrices: [String: [Double]] = [
 ]
 
 /// User overrides and additions, shared with the CLI: {"model": [in, out, cache_read, write_5m, write_1h]}.
-let pricesOverrideURL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/tokenmeter/prices.json")
+let pricesOverrideURL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/tokenly/prices.json")
 
 func loadPrices() -> [String: [Double]] {
     var p = defaultPrices
@@ -40,7 +40,7 @@ func openPricesFile() {
     let fm = FileManager.default
     if !fm.fileExists(atPath: pricesOverrideURL.path) {
         try? fm.createDirectory(at: pricesOverrideURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var d: [String: Any] = ["_comment": "USD per 1M tokens: input, output, cache_read, cache_write_5m, cache_write_1h. Used by TokenMeter app and CLI."]
+        var d: [String: Any] = ["_comment": "USD per 1M tokens: input, output, cache_read, cache_write_5m, cache_write_1h. Used by Tokenly app and CLI."]
         for (k, v) in loadPrices() { d[k] = v }
         if let data = try? JSONSerialization.data(withJSONObject: d, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: pricesOverrideURL)
@@ -398,7 +398,7 @@ final class VibeImporter {
     private var cache: Cache?
     private let recentDays = 8
     private let cacheURL = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("TokenMeter/vibe-history.json")
+        .appendingPathComponent("Tokenly/vibe-history.json")
     private let dayFmt: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"
@@ -418,7 +418,7 @@ final class VibeImporter {
         c.queryItems = params.merging(["tz": TimeZone.current.identifier]) { a, _ in a }.map { URLQueryItem(name: $0.key, value: $0.value) }
         var req = URLRequest(url: c.url!, timeoutInterval: 30)
         req.setValue("Bearer \(cfg.key)", forHTTPHeaderField: "Authorization")
-        req.setValue("TokenMeter", forHTTPHeaderField: "User-Agent")
+        req.setValue("Tokenly", forHTTPHeaderField: "User-Agent")
         let done = DispatchSemaphore(value: 0)
         var out: [Bucket]?
         URLSession.shared.dataTask(with: req) { data, resp, err in
@@ -521,6 +521,15 @@ final class Prefs: ObservableObject {
         let i = Prefs.textScales.firstIndex(of: textScale) ?? 1
         textScale = Prefs.textScales[max(0, min(Prefs.textScales.count - 1, i + d))]
     }
+    // Overview sections (Settings → Overview). Defaults keep the page short.
+    @Published var showInsight: Bool { didSet { ud.set(showInsight, forKey: "showInsight") } }
+    @Published var showDetails: Bool { didSet { ud.set(showDetails, forKey: "showDetails") } }
+    @Published var showTrend: Bool { didSet { ud.set(showTrend, forKey: "showTrend") } }
+    @Published var showLimits: Bool { didSet { ud.set(showLimits, forKey: "showLimits") } }
+    @Published var showLimitDetails: Bool { didSet { ud.set(showLimitDetails, forKey: "showLimitDetails") } }
+    @Published var showPeriodStats: Bool { didSet { ud.set(showPeriodStats, forKey: "showPeriodStats") } }
+    /// Color the menu bar text orange/red at the plan-limit alert (off: plain text).
+    @Published var colorMenuBar: Bool { didSet { ud.set(colorMenuBar, forKey: "colorMenuBar"); onChange?() } }
     /// Solid dark panel background (default), so text stays readable over light windows; off = see-through glass.
     @Published var solidBackground: Bool { didSet { ud.set(solidBackground, forKey: "solidBackground"); onChange?() } }
     /// Panel text size: 1.0 default, 1.15 large, 1.3 larger.
@@ -534,7 +543,7 @@ final class Prefs: ObservableObject {
             } catch {
                 let a = NSAlert()
                 a.messageText = "Could not change login item"
-                a.informativeText = "\(error.localizedDescription)\nMove TokenMeter.app to /Applications and try again."
+                a.informativeText = "\(error.localizedDescription)\nMove Tokenly.app to /Applications and try again."
                 a.runModal()
                 DispatchQueue.main.async { self.launchAtLogin = svc.status == .enabled }
             }
@@ -548,6 +557,13 @@ final class Prefs: ObservableObject {
         includeOtherDevices = ud.bool(forKey: "includeOtherDevices")
         textScale = CGFloat(ud.object(forKey: "textScale") as? Double ?? 1.15)
         solidBackground = ud.object(forKey: "solidBackground") as? Bool ?? true
+        showInsight = ud.object(forKey: "showInsight") as? Bool ?? true
+        showDetails = ud.object(forKey: "showDetails") as? Bool ?? false
+        showTrend = ud.object(forKey: "showTrend") as? Bool ?? true
+        showLimits = ud.object(forKey: "showLimits") as? Bool ?? true
+        showLimitDetails = ud.object(forKey: "showLimitDetails") as? Bool ?? false
+        showPeriodStats = ud.object(forKey: "showPeriodStats") as? Bool ?? false
+        colorMenuBar = ud.object(forKey: "colorMenuBar") as? Bool ?? false
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 }
@@ -589,7 +605,7 @@ final class Store: ObservableObject {
     @Published var contentHeight: CGFloat = 0 // measured panel content, for the popover's scroll cap
     var onUpdate: ((Report) -> Void)?
     private let scanner = Scanner()
-    private let queue = DispatchQueue(label: "tokenmeter.scan", qos: .utility) // serializes scanner access
+    private let queue = DispatchQueue(label: "tokenly.scan", qos: .utility) // serializes scanner access
 
     @Published var refreshing = false
     func refresh() {
@@ -732,8 +748,8 @@ struct WidgetView: View {
                     monthly(r)
                 default:
                     hero(r)
-                    if !r.quotas.isEmpty { quotas(r) }
-                    totals(r)
+                    if prefs.showLimits && !r.quotas.isEmpty { quotas(r) }
+                    if prefs.showPeriodStats { totals(r) }
                 }
                 if !r.unpriced.isEmpty {
                     Label("No price for \(r.unpriced.sorted().joined(separator: ", ")) — add it in Settings › Pricing",
@@ -756,7 +772,7 @@ struct WidgetView: View {
         HStack(spacing: 7) {
             HStack(spacing: 5) {
                 Image(systemName: "chart.bar.fill").foregroundColor(accent)
-                Text("TOKENMETER").font(.system(size: fs(11), weight: .semibold).width(.expanded)).tracking(0.8)
+                Text("TOKENLY").font(.system(size: fs(11), weight: .semibold).width(.expanded)).tracking(0.8)
                     .fixedSize()
             }
             .contentShape(Rectangle())
@@ -915,7 +931,7 @@ struct WidgetView: View {
                                 .background(Capsule().fill(Color.primary.opacity(0.09))).foregroundColor(.secondary)
                         }
                         Spacer()
-                        if let at = q.asOf, Date().timeIntervalSince(at) > 3600 {
+                        if prefs.showLimitDetails, let at = q.asOf, Date().timeIntervalSince(at) > 3600 {
                             Text("as of \(relative(at))").font(.system(size: fs(9.5))).foregroundColor(.secondary)
                         }
                     }
@@ -924,14 +940,19 @@ struct WidgetView: View {
                             HStack(spacing: 6) {
                                 Text(m.label).foregroundColor(.secondary)
                                 Spacer()
-                                if let reset = m.resetsAt { Text("resets \(relative(reset))").foregroundColor(.secondary) }
+                                if let reset = m.resetsAt {
+                                    Text(prefs.showLimitDetails ? "resets \(relative(reset))" : relative(reset)).foregroundColor(.secondary)
+                                }
                                 Text("\(Int(m.percent.rounded()))%").fontWeight(.semibold)
                                     .foregroundColor(m.percent >= 70 ? quotaColor(m.percent) : .primary)
                                     .frame(minWidth: fs(34), alignment: .trailing)
                             }
                             .font(.system(size: fs(10.5))).monospacedDigit()
                             bar(m.percent / 100, quotaColor(m.percent), height: 4)
-                            if let e = m.elapsed, let proj = m.projected {
+                            if !prefs.showLimitDetails, let proj = m.projected, proj > 100, m.percent < 100 {
+                                Text("may run out before reset").font(.system(size: fs(9.5))).foregroundColor(.secondary)
+                            }
+                            if prefs.showLimitDetails, let e = m.elapsed, let proj = m.projected {
                                 bar(e, Color.primary.opacity(0.35), height: 2)
                                 HStack {
                                     Text("\(Int((e * 100).rounded()))% of window passed")
@@ -963,10 +984,7 @@ struct WidgetView: View {
         let prev = store.preset == .all && pickedDay == nil ? Row() : sum(scoped(r, g.previous.from, g.previous.to))
         let remote = es.contains { $0.device != thisMac }
         return VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                cap("\(g.title) · \(scopeName)")
-                Spacer()
-            }
+            if scopeName != "All providers" { cap(scopeName) } // the period is already on the pills
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(usd(cur.cost)).font(.system(size: fs(38), weight: .light).width(.expanded)).monospacedDigit()
                     .lineLimit(1).minimumScaleFactor(0.6)
@@ -979,13 +997,17 @@ struct WidgetView: View {
                         .help("vs the previous \(g.days == 1 ? "day" : "\(g.days) days")")
                 }
             }
-            Text(insight(es, cur, g.days)).font(.system(size: fs(12))).foregroundColor(.primary.opacity(0.85))
+            if prefs.showInsight {
+                Text(insight(es, cur, g.days)).font(.system(size: fs(12))).foregroundColor(.primary.opacity(0.85))
+            }
+            if prefs.showDetails {
             Text(cur.calls == 0 ? "\(tok(cur.tokens)) tokens"
                  : "\(tok(cur.tokens)) tokens · \(Int(cur.calls)) calls · \(duration(activeSeconds(es))) active\(remote ? " on this Mac" : "")")
                 .font(.system(size: fs(10.5))).foregroundColor(.secondary).monospacedDigit()
                 .help("Active time: 5-minute slots with at least one model call")
-            trend(r, g)
-            if remote && g.hourly {
+            }
+            if prefs.showTrend { trend(r, g) }
+            if prefs.showTrend && prefs.showDetails && remote && g.hourly {
                 Text("Other devices report daily totals; they appear in the first hour.")
                     .font(.system(size: fs(9.5))).foregroundColor(.secondary)
             }
@@ -1080,8 +1102,7 @@ struct WidgetView: View {
                 if let i = hi {
                     cap("\(label(i)) · \(usd(slots[i].cost)) · \(tok(slots[i].tokens))\(active[i].isEmpty ? "" : " · " + duration(Double(active[i].count) * slotSeconds))")
                 } else {
-                    cap(g.hourly ? "By hour" : g.unit == .month ? "By month" : "By day")
-                    if let p = peak, maxV > 0 { cap("· peak \(fmt(maxV)) · \(label(p))") }
+                    if prefs.showDetails, let p = peak, maxV > 0 { cap("Peak \(fmt(maxV)) · \(label(p))") }
                 }
                 Spacer()
                 tab("$", store.metric == "cost") { store.metric = "cost" }.help("Cost")
@@ -1354,11 +1375,10 @@ struct WidgetView: View {
                     Label(r.otherDevicesStatus, systemImage: "exclamationmark.triangle").foregroundColor(.orange).lineLimit(1)
                         .help(r.otherDevicesStatus)
                 } else {
-                    cap("Synced \(r.updated.formatted(date: .omitted, time: .shortened)) · \(r.devices.count > 1 ? "\(r.devices.count) devices" : "local only")")
+                    cap(r.updated.formatted(date: .omitted, time: .shortened)).help("Last refresh")
                 }
             }
             Spacer()
-            cap("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")")
             Button { prefs.stepText(-1) } label: { Image(systemName: "textformat.size.smaller") }
                 .help("Smaller text (⌘−)").keyboardShortcut("-", modifiers: .command)
                 .disabled(prefs.textScale == Prefs.textScales.first)
@@ -1395,7 +1415,8 @@ struct SettingsView: View {
                 Picker("Plan limit alert", selection: $prefs.alertThreshold) {
                     ForEach(alertThresholds, id: \.1) { Text($0.0).tag($0.1) }
                 }
-                Text("From this level the fullest plan limit appears next to the cost, in orange, and red from 90%.")
+                Toggle("Color the menu bar at the alert level", isOn: $prefs.colorMenuBar)
+                Text("From this level the fullest plan limit appears next to the cost.")
                     .font(.system(size: fs(11))).foregroundColor(.secondary)
             }
             Section("Appearance") {
@@ -1407,6 +1428,14 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
                 Toggle("Solid background (clearer over light windows)", isOn: $prefs.solidBackground)
             }
+            Section("Overview shows") {
+                Toggle("One-line summary", isOn: $prefs.showInsight)
+                Toggle("Tokens, calls and active time", isOn: $prefs.showDetails)
+                Toggle("Trend chart", isOn: $prefs.showTrend)
+                Toggle("Plan limits", isOn: $prefs.showLimits)
+                Toggle("Plan limit pace and reset details", isOn: $prefs.showLimitDetails)
+                Toggle("Period stats (active days, busiest day, cache saved)", isOn: $prefs.showPeriodStats)
+            }
             Section("General") {
                 Toggle("Launch at login", isOn: $prefs.launchAtLogin)
                 Toggle("Show widget on desktop", isOn: $prefs.showDesktopWidget)
@@ -1415,17 +1444,17 @@ struct SettingsView: View {
                 Toggle("Include my other devices from Vibe Usage", isOn: $prefs.includeOtherDevices)
                     .disabled(VibeImporter.config() == nil && !prefs.includeOtherDevices)
                 Text(VibeImporter.config() == nil
-                     ? "Link the Vibe Usage app on this Mac first. TokenMeter then reads your account's history with the key it stored."
+                     ? "Link the Vibe Usage app on this Mac first. Tokenly then reads your account's history with the key it stored."
                      : "Read-only: downloads your account's usage from vibecafe.ai with the key the Vibe Usage app stored on this Mac, back to your first synced day. Nothing is uploaded. This Mac's numbers always come from its own logs.")
                     .font(.system(size: fs(11))).foregroundColor(.secondary)
             }
             Section("Pricing") {
-                Text("Costs are estimated at API list prices. Override or add models in ~/.config/tokenmeter/prices.json (USD per 1M tokens: input, output, cache read, cache write 5m, cache write 1h). The CLI reads the same file.")
+                Text("Costs are estimated at API list prices. Override or add models in ~/.config/tokenly/prices.json (USD per 1M tokens: input, output, cache read, cache write 5m, cache write 1h). The CLI reads the same file.")
                     .font(.system(size: fs(11))).foregroundColor(.secondary)
                 Button("Edit Prices…") { openPricesFile() }
             }
             Section("About") {
-                Text("TokenMeter \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev") reads the logs Claude Code and Codex write on this Mac. Nothing is uploaded; the only network request is the optional other-devices download.")
+                Text("Tokenly \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev") reads the logs Claude Code and Codex write on this Mac. Nothing is uploaded; the only network request is the optional other-devices download.")
                     .font(.system(size: fs(11))).foregroundColor(.secondary)
             }
         }
@@ -1484,7 +1513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildWindow()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "TM"
-        statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "TokenMeter")
+        statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "Tokenly")
         statusItem.button?.imagePosition = .imageLeading
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusClicked)
@@ -1537,7 +1566,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hosting.autoresizingMask = [.width, .height]
         blur.addSubview(hosting)
 
-        let name = "TokenMeterWidget"
+        let name = "TokenlyWidget"
         if !window.setFrameUsingName(name), let screen = NSScreen.main?.visibleFrame {
             window.setFrameTopLeftPoint(NSPoint(x: screen.maxX - 380, y: screen.maxY - 40))
         }
@@ -1570,13 +1599,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var alert: NSColor?
         if let q = q, let qText = qText, prefs.alertThreshold > 0, q.peak >= Double(prefs.alertThreshold) {
             if prefs.menuBarFormat != "quota" { title += " · \(qText)" }
-            alert = q.peak >= 90 ? NSColor.systemRed : NSColor.systemOrange
-            attrs[.foregroundColor] = alert
+            if prefs.colorMenuBar {
+                alert = q.peak >= 90 ? NSColor.systemRed : NSColor.systemOrange
+                attrs[.foregroundColor] = alert
+            }
         }
         guard let button = statusItem.button else { return }
         if prefs.menuBarFormat == "stacked" {
             // Two small lines in one status item, drawn by SwiftUI (clicks pass through to the button).
-            let top = usd(t.cost) + (alert != nil ? " · \(Int((q?.peak ?? 0).rounded()))%" : "")
+            let top = usd(t.cost) + (title.contains("%") ? " · \(Int((q?.peak ?? 0).rounded()))%" : "")
             let view = AnyView(HStack(spacing: 3) {
                 Image(systemName: "chart.bar.fill").font(.system(size: 11))
                 VStack(alignment: .leading, spacing: -2) {
@@ -1601,11 +1632,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stackedView?.removeFromSuperview()
         stackedView = nil
         statusItem.length = NSStatusItem.variableLength
-        button.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "TokenMeter")
+        button.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "Tokenly")
         button.attributedTitle = NSAttributedString(string: title, attributes: attrs)
     }
 
-    /// Debug: `TokenMeter --snapshot out.png [today|24h|week|month|90d|dayN] [--popover] [provider=…] [model=…]
+    /// Debug: `Tokenly --snapshot out.png [today|24h|week|month|90d|dayN] [--popover] [provider=…] [model=…]
     /// [project=…] [mode=…] [hover=N] [--settings]` renders the panel (or Settings) to a PNG and quits.
     func snapshotIfRequested() {
         let args = CommandLine.arguments
@@ -1673,7 +1704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add(menu, "Launch at Login", #selector(toggleLogin), "", on: prefs.launchAtLogin)
         add(menu, "Settings…", #selector(openSettings), ",")
         menu.addItem(.separator())
-        add(menu, "Quit TokenMeter", #selector(NSApplication.terminate(_:)), "q")
+        add(menu, "Quit Tokenly", #selector(NSApplication.terminate(_:)), "q")
     }
 
     func add(_ menu: NSMenu, _ title: String, _ sel: Selector, _ key: String, on: Bool = false) {
@@ -1705,7 +1736,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openSettings() {
         if settingsWindow == nil {
             let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(prefs: prefs)))
-            w.title = "TokenMeter Settings"
+            w.title = "Tokenly Settings"
             w.styleMask = [.titled, .closable]
             w.isReleasedWhenClosed = false
             settingsWindow = w
@@ -1733,6 +1764,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+/// One-time move from the TokenMeter name: settings, price overrides and the other-devices cache.
+func migrateFromTokenMeter() {
+    let ud = UserDefaults.standard
+    guard !ud.bool(forKey: "migratedFromTokenMeter") else { return }
+    if let old = UserDefaults(suiteName: "io.github.longado.tokenmeter") {
+        for (k, v) in old.dictionaryRepresentation() where ud.object(forKey: k) == nil
+            && !k.hasPrefix("NS") && !k.hasPrefix("Apple") && !k.hasPrefix("com.apple") {
+            ud.set(v, forKey: k)
+        }
+    }
+    let fm = FileManager.default
+    let home = URL(fileURLWithPath: NSHomeDirectory())
+    let oldPrices = home.appendingPathComponent(".config/tokenmeter/prices.json")
+    if fm.fileExists(atPath: oldPrices.path) && !fm.fileExists(atPath: pricesOverrideURL.path) {
+        try? fm.createDirectory(at: pricesOverrideURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? fm.moveItem(at: oldPrices, to: pricesOverrideURL)
+    }
+    let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+    try? fm.moveItem(at: caches.appendingPathComponent("TokenMeter"), to: caches.appendingPathComponent("Tokenly"))
+    ud.set(true, forKey: "migratedFromTokenMeter")
+}
+
+migrateFromTokenMeter()
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

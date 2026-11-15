@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tokenmeter: local token usage, API-equivalent cost and plan limits for Claude Code and Codex CLI.
+"""tokenly: local token usage, API-equivalent cost and plan limits for Claude Code and Codex CLI.
 
 Reads local files only. No network, no upload, no dependencies.
 """
@@ -12,11 +12,11 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # USD per 1M tokens: input, output, cache_read, cache_write_5m, cache_write_1h.
 # Defaults; keep in sync with defaultPrices in macos/main.swift (tests/test_prices.py checks this).
-# Override or add models in ~/.config/tokenmeter/prices.json, shared with the macOS app.
+# Override or add models in ~/.config/tokenly/prices.json, shared with the macOS app.
 PRICES = {
     "claude-fable-5-2": (8, 40, 0.20, 10, 16),
     "claude-opus-5-5": (4, 20, 0.20, 5, 8),
@@ -25,12 +25,15 @@ PRICES = {
     "gpt-6.1-sol": (2, 10, 0.10, 2.5, 2.5),
 }
 FIELDS = ("input", "output", "cache_read", "cache_write", "cost_usd")
-OVERRIDE = os.path.expanduser("~/.config/tokenmeter/prices.json")
+OVERRIDE = os.path.expanduser("~/.config/tokenly/prices.json")
+LEGACY_OVERRIDE = os.path.expanduser("~/.config/tokenmeter/prices.json")  # pre-rename location
 
 
 def load_prices(path=None):
     prices = dict(PRICES)
     try:
+        if path is None and not os.path.exists(OVERRIDE) and os.path.exists(LEGACY_OVERRIDE):
+            path = LEGACY_OVERRIDE
         with open(path or OVERRIDE) as f:
             for k, v in json.load(f).items():
                 if not k.startswith("_") and isinstance(v, list) and len(v) == 5:
@@ -239,7 +242,7 @@ def table(title, data):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="tokenmeter", description=__doc__.strip().splitlines()[0])
+    ap = argparse.ArgumentParser(prog="tokenly", description=__doc__.strip().splitlines()[0])
     ap.add_argument("days", nargs="?", type=int, default=30, help="look back N days (default 30)")
     ap.add_argument("--by", choices=("day", "provider", "model", "project", "all"), default="all",
                     help="grouping to show (default all)")

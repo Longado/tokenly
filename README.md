@@ -1,4 +1,4 @@
-# tokenmeter
+# Tokenly
 
 Local token usage and API-equivalent cost for **Claude Code** and **Codex CLI**.
 One Python file, zero dependencies, no network, nothing uploaded.
@@ -8,19 +8,19 @@ One Python file, zero dependencies, no network, nothing uploaded.
 ## Install
 
 ```bash
-pipx install git+https://github.com/Longado/tokenmeter
+pipx install git+https://github.com/Longado/tokenly
 # or just run it:
-python3 tokenmeter.py
+python3 tokenly.py
 ```
 
 ## Usage
 
 ```bash
-tokenmeter                 # last 30 days, grouped by day / provider / model / project
-tokenmeter 7               # last 7 days
-tokenmeter --by provider   # one grouping: day | provider | model | project | all
-tokenmeter --quota         # plan limits (Claude, Codex) as last recorded locally
-tokenmeter --json          # machine-readable output (also with --quota)
+tokenly                 # last 30 days, grouped by day / provider / model / project
+tokenly 7               # last 7 days
+tokenly --by provider   # one grouping: day | provider | model | project | all
+tokenly --quota         # plan limits (Claude, Codex) as last recorded locally
+tokenly --json          # machine-readable output (also with --quota)
 ```
 
 ```
@@ -34,7 +34,7 @@ TOTAL                      2,001,200     370,000    48,000,000     900,000    51
 
 ## macOS app (menu bar)
 
-`TokenMeter.app` is a native, dependency-free macOS menu bar app (13+). The panel has three pages:
+`Tokenly.app` is a native, dependency-free macOS menu bar app (13+). The panel has three pages:
 **Overview** (cost, trend, plan limits, today / 7 / 30-day totals), **Breakdown** (filters, token mix, by
 provider / model / project / device / day) and **History** (13-week calendar, every month on record). Range and
 device pickers sit under the header and apply to every page. The menu bar shows
@@ -61,21 +61,21 @@ today's cost; click it for the usage panel, right-click for the menu. It refresh
 - Optional desktop widget (menu → Show on Desktop); drag its header to move it.
 - Menu: Refresh, Show on Desktop, Launch at Login, Quit.
 
-Download `TokenMeter.zip` from Releases, unzip, move to `/Applications`. The app is ad-hoc
+Download `Tokenly.zip` from Releases, unzip, move to `/Applications`. The app is ad-hoc
 signed, so the first launch needs right-click → Open. Or build it yourself (Xcode command line tools only):
 
 ```bash
-macos/build.sh            # -> macos/build/TokenMeter.app
-cp -R macos/build/TokenMeter.app /Applications/
+macos/build.sh            # -> macos/build/Tokenly.app
+cp -R macos/build/Tokenly.app /Applications/
 ```
 
-`TokenMeter --snapshot out.png [today|24h|week|month|90d|all|custom from=YYYY-MM-DD to=YYYY-MM-DD|dayN] [--popover|--settings] [hover=N] [device=name] [page=overview|breakdown|history] [provider=OpenAI] [model=gpt-6.1-sol] [project=name] [mode=provider|model|project|day]` renders the panel to a PNG (for development).
+`Tokenly --snapshot out.png [today|24h|week|month|90d|all|custom from=YYYY-MM-DD to=YYYY-MM-DD|dayN] [--popover|--settings] [hover=N] [device=name] [page=overview|breakdown|history] [provider=OpenAI] [model=gpt-6.1-sol] [project=name] [mode=provider|model|project|day]` renders the panel to a PNG (for development).
 
-Prices are in `macos/main.swift` (`prices`) and `tokenmeter.py` (`PRICES`); keep them in sync.
+Prices are in `macos/main.swift` (`prices`) and `tokenly.py` (`PRICES`); keep them in sync.
 
 ## Keeping history
 
-Claude Code deletes session logs after 30 days by default. To keep TokenMeter's history, set
+Claude Code deletes session logs after 30 days by default. To keep Tokenly's history, set
 `"cleanupPeriodDays": 3650` in `~/.claude/settings.json` on every Mac you use.
 
 ## Data sources
@@ -88,8 +88,8 @@ Claude Code deletes session logs after 30 days by default. To keep TokenMeter's 
 ## Pricing
 
 Costs are **API list-price equivalents**, not what a subscription actually charges.
-Defaults live in `PRICES` (`tokenmeter.py`) and `defaultPrices` (`macos/main.swift`); a test keeps them identical.
-Override prices or add models in `~/.config/tokenmeter/prices.json`, read by both the app and the CLI
+Defaults live in `PRICES` (`tokenly.py`) and `defaultPrices` (`macos/main.swift`); a test keeps them identical.
+Override prices or add models in `~/.config/tokenly/prices.json`, read by both the app and the CLI
 (USD per 1M tokens: input, output, cache read, cache write 5m, cache write 1h):
 
 ```json

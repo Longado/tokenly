@@ -1,8 +1,8 @@
-# TokenMeter roadmap
+# Tokenly roadmap
 
 ## Positioning
 
-TokenMeter answers two questions about AI coding, entirely on your machine:
+Tokenly answers two questions about AI coding, entirely on your machine:
 
 1. **What would this cost at list price, and where does it go?** (cost & insight)
 2. **How close am I to my plan limits?** (subscription quota)
@@ -11,7 +11,7 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ### How it differs from similar tools
 
-| | TokenMeter | Vibe Usage (vibe-cafe) | vibeusage (victorGPT) |
+| | Tokenly | Vibe Usage (vibe-cafe) | vibeusage (victorGPT) |
 |---|---|---|---|
 | Core question | Cost & insight, plus quota | Quota & multi-device sync | Leaderboard & public profile |
 | Where data lives | Local only | Uploaded to vibecafe.ai | Uploaded to vibeusage.cc |
@@ -24,6 +24,17 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 **Don't copy:** cloud sync, accounts, leaderboards, bundled runtimes, dense donut grids (our panel is 360 pt wide).
 
 ## Shipped
+
+### v0.17.0 — Tokenly, and a quieter Overview
+- **Renamed from TokenMeter to Tokenly.**
+  - App, bundle id (`io.github.longado.tokenly`), CLI (`tokenly`), repo and price file (`~/.config/tokenly/prices.json`).
+  - On first launch the app migrates settings, price overrides and the other-devices cache. The CLI still reads the old price file if the new one is missing.
+- **Less on one page.**
+  - The period is shown once, on the pills. The headline label appears only when a filter is active.
+  - Hidden by default: the tokens / calls / active line, the chart's peak label, plan-limit pace details, and the period stats card. Each one can be turned on in **Settings → Overview shows**.
+  - Plan limits show percentage and time to reset. "May run out before reset" appears only when the pace says so.
+  - The footer keeps only the refresh time and its buttons.
+- **Plain menu bar.** No orange or red text unless Settings → "Color the menu bar at the alert level" is on.
 
 ### v0.16.1 — bottom card follows the period
 The Overview bottom card showed fixed Today / 7-day / 30-day totals, which ignored the selected period. It now shows numbers for the selected period: active days (or active hours for single-day views), busiest day (or hour) with its date, and cache savings.
@@ -57,7 +68,7 @@ Range (Today … All time) and device pickers moved to one row under the header 
 ### v0.12.0 — other devices and all-time history
 - **Optional other-devices import (off by default).**
   - Uses the key the Vibe Usage app stored in `~/.vibe-usage/config.json` and reads `/api/usage` from vibecafe.ai. Read-only.
-  - History older than 8 days is fetched once in 30-day `from/to` chunks and cached in `~/Library/Caches/TokenMeter/vibe-history.json`. The cache is keyed by a hash of the account key.
+  - History older than 8 days is fetched once in 30-day `from/to` chunks and cached in `~/Library/Caches/Tokenly/vibe-history.json`. The cache is keyed by a hash of the account key.
   - The last 8 days come from `days=8`, refreshed at most every 15 minutes. The `from/to` rollups lag on the newest day; the `days=` query is current.
   - This Mac's own buckets are dropped, because its local logs are authoritative.
   - Other devices are priced with our table when the model is known, otherwise with the server's estimate.
@@ -81,7 +92,7 @@ Range (Today … All time) and device pickers moved to one row under the header 
   - Available from the right-click menu and from Settings.
 - **Settings window.** Menu bar format, alert threshold, launch at login, desktop widget, Edit Prices….
 - **Shared price table.**
-  - `~/.config/tokenmeter/prices.json` overrides or adds models for both the app and the CLI.
+  - `~/.config/tokenly/prices.json` overrides or adds models for both the app and the CLI.
   - The app rescans when prices change, since costs are computed while parsing.
   - `tests/test_prices.py` keeps the Swift and Python defaults identical.
 - **Model names.** Router prefixes, `[1m]`-style tags, Bedrock/Vertex prefixes and version suffixes, and date snapshots are dropped. Effort suffixes are dropped only when the result is a priced model. Long names truncate in the middle with a tooltip.
@@ -129,8 +140,8 @@ CLI, pricing, macOS app, menu bar popover, provider + model filters.
 ### Engineering notes
 - Claude messages are deduplicated by `message.id + requestId` across all files, kept in memory for the app's lifetime.
 - Codex `last_token_usage.input_tokens` includes cached tokens, so the cached amount is subtracted from input.
-- Quota data is whatever the tool last cached locally. TokenMeter never calls provider APIs or reads credentials.
+- Quota data is whatever the tool last cached locally. Tokenly never calls provider APIs or reads credentials.
 - UI self-check:
   ```
-  TokenMeter --snapshot out.png [today|24h|week|month|90d|dayN] [--popover|--settings] [provider=…] [model=…] [project=…] [mode=…] [hover=N]
+  Tokenly --snapshot out.png [today|24h|week|month|90d|dayN] [--popover|--settings] [provider=…] [model=…] [project=…] [mode=…] [hover=N]
   ```
