@@ -977,6 +977,18 @@ struct WidgetView: View {
                             }
                             .font(.system(size: fs(10.5))).monospacedDigit()
                             bar(m.percent / 100, quotaColor(m.percent), height: 4)
+                            if let w = m.window, let reset = m.resetsAt, m.percent >= 5 {
+                                let used = productCost(r, q.product, since: reset.addingTimeInterval(-w))
+                                if used > 0 {
+                                    HStack {
+                                        Text("\(usd(used)) used this window")
+                                        Spacer()
+                                        Text("100% ≈ \(usd(used / m.percent * 100))").fontWeight(.semibold).foregroundColor(.primary)
+                                    }
+                                    .font(.system(size: fs(9.5))).foregroundColor(.secondary).monospacedDigit()
+                                    .help("What this plan's full \(m.label) limit is worth at API list prices, estimated from your usage so far in this window (all devices)")
+                                }
+                            }
                             if !prefs.showLimitDetails, let proj = m.projected, proj > 100, m.percent < 100 {
                                 Text("may run out before reset").font(.system(size: fs(9.5))).foregroundColor(.secondary)
                             }
@@ -1013,17 +1025,11 @@ struct WidgetView: View {
         let remote = es.contains { $0.device != thisMac }
         return VStack(alignment: .leading, spacing: 8) {
             if scopeName != "All providers" { cap(scopeName) } // the period is already on the pills
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(usd(cur.cost)).font(.system(size: fs(38), weight: .light).width(.expanded)).monospacedDigit()
-                    .lineLimit(1).minimumScaleFactor(0.6)
-                if prev.cost > 0.005 {
-                    let pct = (cur.cost - prev.cost) / prev.cost * 100
-                    let c: Color = pct >= 0 ? .orange : .green
-                    Text(pct >= 200 ? String(format: "▲ %.0f×", cur.cost / prev.cost)
-                                     : String(format: "%@ %.0f%%", pct >= 0 ? "▲" : "▼", abs(pct)))
-                        .font(.system(size: fs(10), weight: .semibold)).monospacedDigit().foregroundColor(c)
-                        .help("vs the previous \(g.days == 1 ? "day" : "\(g.days) days")")
-                }
+            // Cost and tokens side by side, each with its change vs the previous period.
+            HStack(alignment: .top, spacing: fs(22)) {
+                headline(usd(cur.cost), "Cost", cur.cost, prev.cost, g.days)
+                headline(tok(cur.tokens), "Tokens", cur.tokens, prev.tokens, g.days)
+                Spacer(minLength: 0)
             }
             if prefs.showInsight {
                 Text(insight(es, cur, g.days)).font(.system(size: fs(12))).foregroundColor(.primary.opacity(0.85))
@@ -1080,6 +1086,32 @@ struct WidgetView: View {
             stat("Cache saved", usd(cur.saved))
         }
         .card()
+    }
+
+    func headline(_ value: String, _ label: String, _ cur: Double, _ prev: Double, _ days: Int) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(value).font(.system(size: fs(31), weight: .light).width(.expanded)).monospacedDigit()
+                .lineLimit(1).minimumScaleFactor(0.6)
+            HStack(spacing: 6) {
+                cap(label)
+                if prev > 0 && cur > 0 {
+                    let pct = (cur - prev) / prev * 100
+                    Text(pct >= 200 ? String(format: "▲ %.0f×", cur / prev) : String(format: "%@ %.0f%%", pct >= 0 ? "▲" : "▼", abs(pct)))
+                        .font(.system(size: fs(9.5), weight: .semibold)).monospacedDigit()
+                        .foregroundColor(pct >= 0 ? .orange : .green)
+                        .help("vs the previous \(days == 1 ? "day" : "\(days) days")")
+                }
+            }
+        }
+    }
+
+    /// API-price cost of one product's usage since `from`, across every device (limits are per account).
+    func productCost(_ r: Report, _ product: String, since from: Date) -> Double {
+        let key = product.lowercased()
+        // other devices only report whole days, so take their days from the window's first day
+        return r.entries.filter {
+            $0.tool.lowercased().contains(key) && ($0.device == thisMac ? $0.hour >= from : $0.day >= cal.startOfDay(for: from))
+        }.reduce(0) { $0 + $1.row.cost }
     }
 
     /// One sentence that says what the numbers mean.

@@ -25,6 +25,15 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.22.0 — tokens beside cost, and what a full plan limit is worth
+- **Headline.** Cost and tokens sit side by side, each with its change vs the previous period.
+- **Full-limit value.**
+  - Each plan limit shows the API-price cost used in the current window and the estimated value of the whole limit ("100% ≈ $1,918"): cost since the window start divided by % used.
+  - The window start is reset time minus window length.
+  - It counts all devices, because limits are per account. Other devices only report whole days, so their first day counts fully.
+  - Shown once the limit is at least 5% used.
+- Idea: with the plan price (e.g. Max $200/month) this becomes "your plan is worth N× its price". This needs a plan-price setting.
+
 ### v0.21.0 — new mark: Prompt T_
 - **New logo.** Picked from three candidate rounds (`docs/logo-candidates*.png`), in the monochrome pixel-type spirit of Vibe Usage's mark: a black terminal block with a green `>` prompt, a pixel **T** and a green `_` cursor, on an 11×10 grid.
 - **Where it's used.**
