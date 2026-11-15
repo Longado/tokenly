@@ -110,6 +110,8 @@ struct Entry {
 struct QuotaMeter: Identifiable {
     let label: String, percent: Double, resetsAt: Date?
     var window: TimeInterval? = nil // window length, for pace
+    var recorded: Double? = nil // the tool's last recorded %, when `percent` is an estimate for now
+    var perFull: Double? = nil // API-price cost of 100% of this limit
     var id: String { label }
     /// Share of the window that has passed (0...1), when known.
     var elapsed: Double? {
@@ -141,6 +143,38 @@ struct Report {
     func entries(from: Date, to: Date) -> [Entry] { entries.filter { $0.hour >= from && $0.hour < to } }
     func total(from: Date, to: Date) -> Row { entries(from: from, to: to).reduce(into: Row()) { $0.add($1.row) } }
     var fullestQuota: Quota? { quotas.max { $0.peak < $1.peak } }
+
+    /// Made-up but realistic data for screenshots (`TOKENLY_DEMO=1`); never mixed with real logs.
+    static func demo() -> Report {
+        var rng = SystemRandomNumberGenerator()
+        var entries: [Entry] = []
+        let models: [(String, String, Double, Double)] = [ // tool, model, $ per 1K-call hour, share
+            ("Claude Code", "claude-opus-5-5", 9.0, 0.5), ("Claude Code", "claude-sonnet-5-5", 3.0, 0.25), ("Codex", "gpt-6.1-sol", 4.0, 0.25)]
+        let projects = ["webapp", "api-server", "docs-site", "infra"]
+        for d in 0..<120 {
+            let day = daysAgo(d)
+            let weekday = cal.component(.weekday, from: day)
+            let dayScale = (weekday == 1 || weekday == 7 ? 0.25 : 1.0) * (1.0 + Double(120 - d) / 60) * Double.random(in: 0.6...1.4, using: &rng)
+            for h in 9...22 where Double.random(in: 0...1, using: &rng) < 0.7 {
+                let hour = cal.date(byAdding: .hour, value: h, to: day)!
+                if hour > Date() { continue }
+                for (tool, model, rate, share) in models {
+                    let cost = rate * share * dayScale * Double.random(in: 0.3...1.7, using: &rng)
+                    let tokens = cost / 0.25 * 1e6 * 0.9
+                    let row = Row(input: tokens * 0.002, output: tokens * 0.01, cacheRead: tokens * 0.95, cacheWrite: tokens * 0.038,
+                                  cost: cost, saved: cost * 4.5, calls: (cost * 12).rounded())
+                    var e = Entry(hour: hour, day: day, tool: tool, model: model, project: projects[(h + d) % projects.count], row: row)
+                    e.slots = Set((0..<Int.random(in: 4...12, using: &rng)).map { Int(hour.timeIntervalSince1970 / slotSeconds) + $0 })
+                    entries.append(e)
+                }
+            }
+        }
+        let quotas = [
+            Quota(product: "Claude", plan: nil, meters: [QuotaMeter(label: "7d", percent: 64, resetsAt: Date().addingTimeInterval(2.2 * 86400), window: 7 * 86400)], asOf: Date()),
+            Quota(product: "Codex", plan: "Pro", meters: [QuotaMeter(label: "7d", percent: 38, resetsAt: Date().addingTimeInterval(4.1 * 86400), window: 7 * 86400)], asOf: Date()),
+        ]
+        return Report(entries: entries, unpriced: [], quotas: quotas)
+    }
 }
 
 func num(_ v: Any?) -> Double { (v as? NSNumber)?.doubleValue ?? 0 }
@@ -148,6 +182,39 @@ let cal = Calendar.current
 func today() -> Date { cal.startOfDay(for: Date()) }
 func tomorrow() -> Date { cal.date(byAdding: .day, value: 1, to: today())! }
 func daysAgo(_ n: Int) -> Date { cal.date(byAdding: .day, value: -n, to: today())! }
+/// API-price cost of one product's usage in [from, to), across every device (plan limits are per account).
+/// Other devices report whole days, so a day that only partly overlaps counts in proportion.
+func productCost(_ entries: [Entry], _ product: String, from: Date, to: Date = Date()) -> Double {
+    let key = product.lowercased(), now = Date()
+    return entries.reduce(0) { acc, e in
+        guard e.tool.lowercased().contains(key) else { return acc }
+        if e.device == thisMac { return e.hour >= from && e.hour < to ? acc + e.row.cost : acc }
+        let dayEnd = min(cal.date(byAdding: .day, value: 1, to: e.day)!, now)
+        let length = dayEnd.timeIntervalSince(e.day)
+        let overlap = max(0, min(dayEnd, to).timeIntervalSince(max(e.day, from)))
+        return length > 0 ? acc + e.row.cost * overlap / length : acc
+    }
+}
+
+/// The tools record plan usage only when they run on this Mac, so a reading goes stale while you work
+/// elsewhere. Estimate it for now: last recorded % plus usage since, at the window's cost-per-% rate.
+func estimateQuotas(_ r: Report) -> [Quota] {
+    r.quotas.map { q in
+        Quota(product: q.product, plan: q.plan, meters: q.meters.map { m in
+            guard let w = m.window, let reset = m.resetsAt, let asOf = q.asOf, m.percent >= 5 else { return m }
+            let before = productCost(r.entries, q.product, from: reset.addingTimeInterval(-w), to: asOf)
+            guard before > 0 else { return m }
+            let perFull = before / m.percent * 100
+            let after = Date().timeIntervalSince(asOf) > 900 ? productCost(r.entries, q.product, from: asOf) : 0
+            var out = m
+            out.perFull = perFull
+            if after > 0 { out.recorded = m.percent; out = QuotaMeter(label: m.label, percent: min(100, m.percent + after / perFull * 100),
+                                                                      resetsAt: reset, window: w, recorded: m.percent, perFull: perFull) }
+            return out
+        }, asOf: q.asOf)
+    }
+}
+
 func activeSeconds(_ es: [Entry]) -> Double {
     Double(es.reduce(into: Set<Int>()) { $0.formUnion($1.slots) }.count) * slotSeconds
 }
@@ -371,6 +438,7 @@ final class Scanner {
             report.entries += remoteEntries()
             report.otherDevicesStatus = vibe.status
         }
+        report.quotas = estimateQuotas(report)
         return report
     }
 }
@@ -616,7 +684,8 @@ final class Store: ObservableObject {
     func refresh() {
         refreshing = true
         queue.async {
-            let r = self.scanner.run(otherDevices: Prefs.shared.includeOtherDevices)
+            let r = ProcessInfo.processInfo.environment["TOKENLY_DEMO"] != nil ? Report.demo()
+                : self.scanner.run(otherDevices: Prefs.shared.includeOtherDevices)
             DispatchQueue.main.async { self.report = r; self.refreshing = false; self.onUpdate?(r) }
         }
     }
@@ -971,23 +1040,25 @@ struct WidgetView: View {
                                 if let reset = m.resetsAt {
                                     Text(prefs.showLimitDetails ? "resets \(relative(reset))" : relative(reset)).foregroundColor(.secondary)
                                 }
-                                Text("\(Int(m.percent.rounded()))%").fontWeight(.semibold)
+                                Text("\(m.recorded != nil ? "≈" : "")\(Int(m.percent.rounded()))%").fontWeight(.semibold)
                                     .foregroundColor(m.percent >= 70 ? quotaColor(m.percent) : .primary)
                                     .frame(minWidth: fs(34), alignment: .trailing)
                             }
                             .font(.system(size: fs(10.5))).monospacedDigit()
                             bar(m.percent / 100, quotaColor(m.percent), height: 4)
-                            if let w = m.window, let reset = m.resetsAt, m.percent >= 5 {
-                                let used = productCost(r, q.product, since: reset.addingTimeInterval(-w))
-                                if used > 0 {
-                                    HStack {
-                                        Text("\(usd(used)) used this window")
-                                        Spacer()
-                                        Text("100% ≈ \(usd(used / m.percent * 100))").fontWeight(.semibold).foregroundColor(.primary)
+                            if let perFull = m.perFull {
+                                HStack {
+                                    if let rec = m.recorded, let at = q.asOf {
+                                        Text("\(Int(rec.rounded()))% recorded \(relative(at)) + usage since")
+                                            .help("\(q.product) last recorded \(Int(rec.rounded()))% on this Mac \(relative(at)); the rest is estimated from usage on all devices since then")
+                                    } else {
+                                        Text("\(usd(perFull * m.percent / 100)) used this window")
                                     }
-                                    .font(.system(size: fs(9.5))).foregroundColor(.secondary).monospacedDigit()
-                                    .help("What this plan's full \(m.label) limit is worth at API list prices, estimated from your usage so far in this window (all devices)")
+                                    Spacer()
+                                    Text("100% ≈ \(usd(perFull))").fontWeight(.semibold).foregroundColor(.primary)
+                                        .help("What this plan's full \(m.label) limit is worth at API list prices, from usage in this window up to the last recorded %")
                                 }
+                                .font(.system(size: fs(9.5))).foregroundColor(.secondary).monospacedDigit()
                             }
                             if !prefs.showLimitDetails, let proj = m.projected, proj > 100, m.percent < 100 {
                                 Text("may run out before reset").font(.system(size: fs(9.5))).foregroundColor(.secondary)
@@ -1103,15 +1174,6 @@ struct WidgetView: View {
                 }
             }
         }
-    }
-
-    /// API-price cost of one product's usage since `from`, across every device (limits are per account).
-    func productCost(_ r: Report, _ product: String, since from: Date) -> Double {
-        let key = product.lowercased()
-        // other devices only report whole days, so take their days from the window's first day
-        return r.entries.filter {
-            $0.tool.lowercased().contains(key) && ($0.device == thisMac ? $0.hour >= from : $0.day >= cal.startOfDay(for: from))
-        }.reduce(0) { $0 + $1.row.cost }
     }
 
     /// One sentence that says what the numbers mean.

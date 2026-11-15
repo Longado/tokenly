@@ -25,6 +25,13 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.23.0 — plan limits estimated for now
+- **The problem.** Codex and Claude Code record plan usage only when they run on this Mac. While you work on other devices, the recorded % falls behind: Tokenly showed 42% while Codex showed 52%.
+- **The fix.** Tokenly now estimates the current %: the last recorded % plus usage since then on all devices, at the window's cost per %. The estimate is marked "≈", with "N% recorded X ago + usage since". Real data: ≈53% vs 52% actual.
+- **Honest full-limit value.** "100% ≈ $…" now uses only usage up to the recorded reading, so later usage no longer inflates it.
+- **Demo data.** `TOKENLY_DEMO=1` makes the app show made-up data, used for the website screenshots.
+- **Website.** `docs/index.html` is the GitHub Pages landing page, with demo screenshots in `docs/assets`.
+
 ### v0.22.0 — tokens beside cost, and what a full plan limit is worth
 - **Headline.** Cost and tokens sit side by side, each with its change vs the previous period.
 - **Full-limit value.**
