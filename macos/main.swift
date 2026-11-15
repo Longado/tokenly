@@ -528,6 +528,8 @@ final class Prefs: ObservableObject {
     @Published var showLimits: Bool { didSet { ud.set(showLimits, forKey: "showLimits") } }
     @Published var showLimitDetails: Bool { didSet { ud.set(showLimitDetails, forKey: "showLimitDetails") } }
     @Published var showPeriodStats: Bool { didSet { ud.set(showPeriodStats, forKey: "showPeriodStats") } }
+    /// Panel unfolded: Overview plus Breakdown and History on one scrolling page.
+    @Published var expanded: Bool { didSet { ud.set(expanded, forKey: "expanded") } }
     /// Color the menu bar text orange/red at the plan-limit alert (off: plain text).
     @Published var colorMenuBar: Bool { didSet { ud.set(colorMenuBar, forKey: "colorMenuBar"); onChange?() } }
     /// Solid dark panel background (default), so text stays readable over light windows; off = see-through glass.
@@ -564,6 +566,7 @@ final class Prefs: ObservableObject {
         showLimitDetails = ud.object(forKey: "showLimitDetails") as? Bool ?? false
         showPeriodStats = ud.object(forKey: "showPeriodStats") as? Bool ?? false
         colorMenuBar = ud.object(forKey: "colorMenuBar") as? Bool ?? false
+        expanded = ud.bool(forKey: "expanded")
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 }
@@ -738,19 +741,19 @@ struct WidgetView: View {
             header
             if let r = store.report {
                 controls(r)
-                switch store.page {
-                case "breakdown":
+                hero(r)
+                if prefs.showLimits && !r.quotas.isEmpty { quotas(r) }
+                if prefs.showPeriodStats { totals(r) }
+                if prefs.expanded {
+                    section("Breakdown")
                     filters(r)
                     tokenMix(r)
                     breakdown(r)
-                case "history":
+                    section("History")
                     activity(r)
                     monthly(r)
-                default:
-                    hero(r)
-                    if prefs.showLimits && !r.quotas.isEmpty { quotas(r) }
-                    if prefs.showPeriodStats { totals(r) }
                 }
+                foldButton
                 if !r.unpriced.isEmpty {
                     Label("No price for \(r.unpriced.sorted().joined(separator: ", ")) — add it in Settings › Pricing",
                           systemImage: "exclamationmark.triangle")
@@ -778,10 +781,33 @@ struct WidgetView: View {
             .contentShape(Rectangle())
             .overlay(inPopover ? nil : DragHandle(menu: menu)) // desktop: drag to move, right-click for menu
             Spacer(minLength: 4)
-            ForEach([("Overview", "overview"), ("Breakdown", "breakdown"), ("History", "history")], id: \.1) { t in
-                tab(t.0, store.page == t.1) { store.page = t.1 }
+            Button { prefs.expanded.toggle() } label: {
+                Image(systemName: prefs.expanded ? "chevron.up.circle" : "chevron.down.circle").font(.system(size: fs(14)))
             }
+            .buttonStyle(.borderless).foregroundColor(.secondary)
+            .help(prefs.expanded ? "Fold to the overview" : "Show breakdown and history")
         }
+    }
+
+    /// Divider label between the overview and the unfolded sections.
+    func section(_ title: String) -> some View {
+        HStack(spacing: 8) {
+            cap(title)
+            Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 1)
+        }
+        .padding(.top, 4)
+    }
+
+    var foldButton: some View {
+        Button { prefs.expanded.toggle() } label: {
+            HStack(spacing: 4) {
+                Text(prefs.expanded ? "Show less" : "Show all")
+                Image(systemName: prefs.expanded ? "chevron.up" : "chevron.down")
+            }
+            .font(.system(size: fs(11), weight: .medium)).foregroundColor(.secondary)
+            .frame(maxWidth: .infinity).padding(.vertical, 2).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     /// Period pills (like Vibe Usage's date row), custom dates, and the device picker; shared by every page.
@@ -1651,7 +1677,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let v = arg("project") { store.project = v }
         if let v = arg("hover") { store.hover = Int(v) }
         if let v = arg("device") { store.device = v }
-        if let v = arg("page") { store.page = v }
+        if let v = arg("page") { prefs.expanded = v != "overview" }
         if mode == "custom" {
             store.preset = .custom
             if let v = arg("from"), let d = parseDate(v + "T00:00:00Z") { store.customFrom = cal.startOfDay(for: d.addingTimeInterval(43200)) }

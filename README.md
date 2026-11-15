@@ -34,10 +34,9 @@ TOTAL                      2,001,200     370,000    48,000,000     900,000    51
 
 ## macOS app (menu bar)
 
-`Tokenly.app` is a native, dependency-free macOS menu bar app (13+). The panel has three pages:
-**Overview** (cost, trend, plan limits, today / 7 / 30-day totals), **Breakdown** (filters, token mix, by
-provider / model / project / device / day) and **History** (13-week calendar, every month on record). Range and
-device pickers sit under the header and apply to every page. The menu bar shows
+`Tokenly.app` is a native, dependency-free macOS menu bar app (13+). The panel opens folded on the
+overview (cost, trend, plan limits); "Show all" unfolds Breakdown (filters, token mix, by provider / model / project
+/ device / day) and History (13-week calendar, every month on record) on the same page. The menu bar shows
 today's cost; click it for the usage panel, right-click for the menu. It refreshes every 5 minutes and on wake.
 
 - Plan limits: Claude and Codex subscription windows (5h / 7d) as the tools last recorded them locally, with how
@@ -69,7 +68,7 @@ macos/build.sh            # -> macos/build/Tokenly.app
 cp -R macos/build/Tokenly.app /Applications/
 ```
 
-`Tokenly --snapshot out.png [today|24h|week|month|90d|all|custom from=YYYY-MM-DD to=YYYY-MM-DD|dayN] [--popover|--settings] [hover=N] [device=name] [page=overview|breakdown|history] [provider=OpenAI] [model=gpt-6.1-sol] [project=name] [mode=provider|model|project|day]` renders the panel to a PNG (for development).
+`Tokenly --snapshot out.png [today|24h|week|month|90d|all|custom from=YYYY-MM-DD to=YYYY-MM-DD|dayN] [--popover|--settings] [hover=N] [device=name] [page=overview|all] [provider=OpenAI] [model=gpt-6.1-sol] [project=name] [mode=provider|model|project|day]` renders the panel to a PNG (for development).
 
 Prices are in `macos/main.swift` (`prices`) and `tokenly.py` (`PRICES`); keep them in sync.
 

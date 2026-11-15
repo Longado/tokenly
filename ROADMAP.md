@@ -25,6 +25,9 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.18.0 — fold / unfold instead of pages
+The Overview / Breakdown / History tabs are replaced by one fold control. Folded (the default) shows only the overview. "Show all" at the bottom, or the chevron in the header, unfolds Breakdown and History below it on one scrolling page, with section labels. The state is remembered.
+
 ### v0.17.0 — Tokenly, and a quieter Overview
 - **Renamed from TokenMeter to Tokenly.**
   - App, bundle id (`io.github.longado.tokenly`), CLI (`tokenly`), repo and price file (`~/.config/tokenly/prices.json`).
