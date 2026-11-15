@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenmeter"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local token usage and API-equivalent cost for Claude Code and Codex CLI"
 readme = "README.md"
 license = { text = "MIT" }

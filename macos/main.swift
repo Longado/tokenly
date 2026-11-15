@@ -1,22 +1,72 @@
-// TokenMeter.app: menu bar panel (and optional desktop widget) showing local token usage and
-// API-equivalent cost for Claude Code and Codex CLI. Reads local logs only.
+// TokenMeter.app: menu bar panel (and optional desktop widget) showing local token usage,
+// API-equivalent cost and subscription limits for Claude Code and Codex CLI. Reads local files only.
 import AppKit
 import Combine
 import ServiceManagement
 import SwiftUI
 
-let scanDays = 98 // 13-week activity grid (+ partial week); also covers the 30-day "vs previous" delta
+let scanDays = 182 // 90-day range plus its "vs previous" period, and the 13-week activity grid
 let refreshSeconds: TimeInterval = 300
+let slotSeconds: TimeInterval = 300 // active time = 5-minute slots with at least one call
 
-// USD per 1M tokens: input, output, cache_read, cache_write_5m, cache_write_1h
-// Keep in sync with PRICES in tokenmeter.py.
-let prices: [String: [Double]] = [
+// MARK: - Pricing
+
+// USD per 1M tokens: input, output, cache_read, cache_write_5m, cache_write_1h.
+// Keep in sync with PRICES in tokenmeter.py (tests/test_prices.py checks this).
+let defaultPrices: [String: [Double]] = [
     "claude-fable-5-2": [8, 40, 0.20, 10, 16],
     "claude-opus-5-5": [4, 20, 0.20, 5, 8],
     "claude-sonnet-5-5": [2, 10, 0.10, 2.5, 4],
     "claude-haiku-5-5": [0.10, 0.50, 0.01, 0.125, 0.20],
     "gpt-6.1-sol": [2, 10, 0.10, 2.5, 2.5],
 ]
+
+/// User overrides and additions, shared with the CLI: {"model": [in, out, cache_read, write_5m, write_1h]}.
+let pricesOverrideURL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/tokenmeter/prices.json")
+
+func loadPrices() -> [String: [Double]] {
+    var p = defaultPrices
+    if let data = try? Data(contentsOf: pricesOverrideURL),
+       let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        for (k, v) in d where !k.hasPrefix("_") {
+            if let a = v as? [NSNumber], a.count == 5 { p[k.lowercased()] = a.map { $0.doubleValue } }
+        }
+    }
+    return p
+}
+
+/// Opens the override file in TextEdit, creating it from the current table first.
+func openPricesFile() {
+    let fm = FileManager.default
+    if !fm.fileExists(atPath: pricesOverrideURL.path) {
+        try? fm.createDirectory(at: pricesOverrideURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var d: [String: Any] = ["_comment": "USD per 1M tokens: input, output, cache_read, cache_write_5m, cache_write_1h. Used by TokenMeter app and CLI."]
+        for (k, v) in loadPrices() { d[k] = v }
+        if let data = try? JSONSerialization.data(withJSONObject: d, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: pricesOverrideURL)
+        }
+    }
+    NSWorkspace.shared.open([pricesOverrideURL], withApplicationAt: URL(fileURLWithPath: "/System/Applications/TextEdit.app"),
+                            configuration: NSWorkspace.OpenConfiguration())
+}
+
+/// One name per underlying model: drops router prefixes, context tags, date snapshots and
+/// (when that yields a priced model) reasoning-effort suffixes.
+func normalizeModel(_ raw: String, _ known: [String: [Double]]) -> String {
+    var m = raw.lowercased()
+    if let r = m.firstIndex(of: "[") { m = String(m[..<r]) }
+    if let s = m.lastIndex(of: "/") { m = String(m[m.index(after: s)...]) }
+    for p in ["global.anthropic.", "us.anthropic.", "eu.anthropic.", "apac.anthropic.", "anthropic."] where m.hasPrefix(p) {
+        m.removeFirst(p.count)
+    }
+    m = m.replacingOccurrences(of: #"-v\d+(:\d+)?$"#, with: "", options: .regularExpression)
+    m = m.replacingOccurrences(of: #"[-@]\d{8}$"#, with: "", options: .regularExpression)
+    if known[m] == nil {
+        let s = m.replacingOccurrences(of: #"-(minimal|low|medium|high|xhigh|max)$"#, with: "", options: .regularExpression)
+        if known[s] != nil { m = s }
+    }
+    return m
+}
 
 // Billing provider, derived from the model name; the tool (Claude Code, Codex) is just the log source.
 let providers: [(name: String, color: Color)] = [
@@ -45,10 +95,11 @@ struct Row {
     }
 }
 
-/// Usage of one model in one project on one local day.
+/// Usage of one model in one project during one local hour.
 struct Entry {
-    let day: Date, tool: String, model: String, project: String
-    var row: Row
+    let hour: Date, day: Date, tool: String, model: String, project: String
+    var row = Row()
+    var slots = Set<Int>() // 5-minute slots with at least one call, for active time
     var provider: String { providerOf(model) }
 }
 
@@ -71,16 +122,20 @@ struct Report {
     var quotas: [Quota] = []
     var updated = Date()
 
-    func entries(from: Date, to: Date) -> [Entry] { entries.filter { $0.day >= from && $0.day <= to } }
-    func total(from: Date, to: Date) -> Row {
-        entries(from: from, to: to).reduce(into: Row()) { $0.add($1.row) }
-    }
+    /// Entries whose hour lies in [from, to).
+    func entries(from: Date, to: Date) -> [Entry] { entries.filter { $0.hour >= from && $0.hour < to } }
+    func total(from: Date, to: Date) -> Row { entries(from: from, to: to).reduce(into: Row()) { $0.add($1.row) } }
+    var fullestQuota: Quota? { quotas.max { $0.peak < $1.peak } }
 }
 
 func num(_ v: Any?) -> Double { (v as? NSNumber)?.doubleValue ?? 0 }
 let cal = Calendar.current
 func today() -> Date { cal.startOfDay(for: Date()) }
+func tomorrow() -> Date { cal.date(byAdding: .day, value: 1, to: today())! }
 func daysAgo(_ n: Int) -> Date { cal.date(byAdding: .day, value: -n, to: today())! }
+func activeSeconds(_ es: [Entry]) -> Double {
+    Double(es.reduce(into: Set<Int>()) { $0.formUnion($1.slots) }.count) * slotSeconds
+}
 
 private let isoFrac: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter()
@@ -109,18 +164,24 @@ final class FileState {
 final class Scanner {
     private var files: [String: FileState] = [:]
     private var seenClaude = Set<String>()
+    private var prices: [String: [Double]] = [:]
     private let env = ProcessInfo.processInfo.environment
 
-    func add(_ st: FileState, _ date: Date, _ tool: String, _ model: String, _ project: String,
+    func add(_ st: FileState, _ date: Date, _ tool: String, _ rawModel: String, _ project: String,
              _ i: Double, _ o: Double, _ cr: Double, _ cw: Double, _ cw1h: Double = 0) {
-        guard i + o + cr + cw > 0 else { return }
+        guard i + o + cr + cw > 0, !rawModel.hasPrefix("<") else { return }
+        let model = normalizeModel(rawModel, prices)
         let p = prices[model] ?? [0, 0, 0, 0, 0]
         if prices[model] == nil { st.unpriced.insert(model) }
         let cost = (i * p[0] + o * p[1] + cr * p[2] + (cw - cw1h) * p[3] + cw1h * p[4]) / 1e6
         let r = Row(input: i, output: o, cacheRead: cr, cacheWrite: cw, cost: cost, saved: cr * (p[0] - p[2]) / 1e6, calls: 1)
-        let day = cal.startOfDay(for: date)
-        let key = "\(day.timeIntervalSince1970)|\(model)|\(project)"
-        st.buckets[key, default: Entry(day: day, tool: tool, model: model, project: project, row: Row())].row.add(r)
+        let hour = cal.dateInterval(of: .hour, for: date)!.start
+        let key = "\(hour.timeIntervalSince1970)|\(model)|\(project)"
+        if st.buckets[key] == nil {
+            st.buckets[key] = Entry(hour: hour, day: cal.startOfDay(for: date), tool: tool, model: model, project: project)
+        }
+        st.buckets[key]!.row.add(r)
+        st.buckets[key]!.slots.insert(Int(date.timeIntervalSince1970 / slotSeconds))
     }
 
     /// .jsonl files under `dir` modified since `since`.
@@ -252,6 +313,8 @@ final class Scanner {
     }
 
     func run() -> Report {
+        let p = loadPrices()
+        if p != prices { prices = p; files = [:]; seenClaude = [] } // costs are computed while parsing
         let since = daysAgo(scanDays - 1)
         let alive = Set(scanClaude(env["CLAUDE_CONFIG_DIR"] ?? "~/.claude", since: since)
                         + scanCodex(env["CODEX_HOME"] ?? "~/.codex", since: since))
@@ -261,7 +324,10 @@ final class Scanner {
         for st in files.values {
             unpriced.formUnion(st.unpriced)
             for (k, e) in st.buckets where e.day >= since {
-                if merged[k] == nil { merged[k] = e } else { merged[k]!.row.add(e.row) }
+                if merged[k] == nil { merged[k] = e } else {
+                    merged[k]!.row.add(e.row)
+                    merged[k]!.slots.formUnion(e.slots)
+                }
             }
         }
         return Report(entries: Array(merged.values), unpriced: unpriced,
@@ -273,9 +339,15 @@ final class Scanner {
 
 func usd(_ v: Double) -> String { v >= 1000 ? String(format: "$%.0f", v) : String(format: "$%.2f", v) }
 func tok(_ v: Double) -> String {
-    v >= 1e9 ? String(format: "%.1fB", v / 1e9) : v >= 1e6 ? String(format: "%.1fM", v / 1e6) : v >= 1e3 ? String(format: "%.0fK", v / 1e3) : String(format: "%.0f", v)
+    v >= 1e9 ? String(format: "%.1fB", v / 1e9) : v >= 1e6 ? String(format: "%.1fM", v / 1e6)
+        : v >= 1e3 ? String(format: "%.0fK", v / 1e3) : String(format: "%.0f", v)
 }
 func dayLabel(_ d: Date) -> String { d.formatted(.dateTime.month(.abbreviated).day()) }
+func hourLabel(_ d: Date) -> String { d.formatted(date: .omitted, time: .shortened) }
+func duration(_ s: Double) -> String {
+    let m = Int(s / 60)
+    return m >= 60 ? "\(m / 60)h \(m % 60)m" : "\(m)m"
+}
 private let relFmt: RelativeDateTimeFormatter = {
     let f = RelativeDateTimeFormatter()
     f.unitsStyle = .short
@@ -283,24 +355,93 @@ private let relFmt: RelativeDateTimeFormatter = {
 }()
 func relative(_ d: Date) -> String { relFmt.localizedString(for: d, relativeTo: Date()) }
 
+// MARK: - Preferences
+
+/// Settings shared by the menu, the Settings window and the menu bar title.
+final class Prefs: ObservableObject {
+    static let shared = Prefs()
+    private let ud = UserDefaults.standard
+    var onChange: (() -> Void)?
+
+    /// cost | tokens | both | quota
+    @Published var menuBarFormat: String { didSet { ud.set(menuBarFormat, forKey: "menuBarFormat"); onChange?() } }
+    /// Show the fullest plan limit in the menu bar from this % (0 = off).
+    @Published var alertThreshold: Int { didSet { ud.set(alertThreshold, forKey: "alertThreshold"); onChange?() } }
+    @Published var showDesktopWidget: Bool { didSet { ud.set(showDesktopWidget, forKey: "showDesktopWidget"); onChange?() } }
+    @Published var launchAtLogin: Bool {
+        didSet {
+            let svc = SMAppService.mainApp
+            guard launchAtLogin != (svc.status == .enabled) else { return }
+            do {
+                if launchAtLogin { try svc.register() } else { try svc.unregister() }
+            } catch {
+                let a = NSAlert()
+                a.messageText = "Could not change login item"
+                a.informativeText = "\(error.localizedDescription)\nMove TokenMeter.app to /Applications and try again."
+                a.runModal()
+                DispatchQueue.main.async { self.launchAtLogin = svc.status == .enabled }
+            }
+        }
+    }
+
+    init() {
+        menuBarFormat = ud.string(forKey: "menuBarFormat") ?? "cost"
+        alertThreshold = ud.object(forKey: "alertThreshold") as? Int ?? 80
+        showDesktopWidget = ud.bool(forKey: "showDesktopWidget")
+        launchAtLogin = SMAppService.mainApp.status == .enabled
+    }
+}
+
+let menuBarFormats = [("Today's cost", "cost"), ("Today's tokens", "tokens"), ("Cost + tokens", "both"), ("Fullest plan limit", "quota")]
+let alertThresholds = [("Off", 0), ("70%", 70), ("80%", 80), ("90%", 90)]
+
 // MARK: - Store
+
+enum Preset: String, CaseIterable, Identifiable {
+    case today = "Today", h24 = "24H", week = "7D", month = "30D", quarter = "90D"
+    var id: String { rawValue }
+    var days: Int { [1, 1, 7, 30, 90][Preset.allCases.firstIndex(of: self)!] }
+    var title: String { ["Today", "Last 24 hours", "Last 7 days", "Last 30 days", "Last 90 days"][Preset.allCases.firstIndex(of: self)!] }
+}
+
+/// A time range [from, to); `hourly` ranges chart by hour, others by day.
+struct Span {
+    let from: Date, to: Date, days: Int, title: String, hourly: Bool
+    var previous: (from: Date, to: Date) { (from.addingTimeInterval(-to.timeIntervalSince(from)), from) }
+}
 
 final class Store: ObservableObject {
     @Published var report: Report?
-    @Published var preset = Preset.today
-    @Published var pickedDay: Date?
+    @Published var preset = Preset.today { didSet { hover = nil } }
+    @Published var pickedDay: Date? { didSet { hover = nil } }
     @Published var provider: String? // nil = all providers
     @Published var model: String? // nil = all models
     @Published var project: String? // nil = all projects
     @Published var mode = "provider" // breakdown: provider | model | project | day
+    @Published var hover: Int? // hovered bar in the trend strip
     @Published var contentHeight: CGFloat = 0 // measured panel content, for the popover's scroll cap
     var onUpdate: ((Report) -> Void)?
     private let scanner = Scanner()
     private let queue = DispatchQueue(label: "tokenmeter.scan", qos: .utility) // serializes scanner access
+
     func refresh() {
         queue.async {
             let r = self.scanner.run()
             DispatchQueue.main.async { self.report = r; self.onUpdate?(r) }
+        }
+    }
+
+    var span: Span {
+        if let d = pickedDay {
+            return Span(from: d, to: cal.date(byAdding: .day, value: 1, to: d)!, days: 1,
+                        title: d.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day()), hourly: true)
+        }
+        switch preset {
+        case .today: return Span(from: today(), to: tomorrow(), days: 1, title: preset.title, hourly: true)
+        case .h24:
+            let next = cal.dateInterval(of: .hour, for: Date())!.end
+            return Span(from: next.addingTimeInterval(-86400), to: next, days: 1, title: preset.title, hourly: true)
+        default: return Span(from: daysAgo(preset.days - 1), to: tomorrow(), days: preset.days, title: preset.title, hourly: false)
         }
     }
 }
@@ -309,13 +450,6 @@ final class Store: ObservableObject {
 
 let accent = Color(red: 0.67, green: 0.58, blue: 1.0)
 let heatWeeks = 13
-
-enum Preset: String, CaseIterable, Identifiable {
-    case today = "Today", week = "7D", month = "30D"
-    var id: String { rawValue }
-    var days: Int { self == .today ? 1 : self == .week ? 7 : 30 }
-    var title: String { self == .today ? "Today" : self == .week ? "Last 7 days" : "Last 30 days" }
-}
 
 /// Small uppercase, letter-spaced section label.
 func cap(_ s: String) -> some View {
@@ -337,7 +471,7 @@ func bar(_ share: Double, _ color: Color = accent, height: CGFloat = 3) -> some 
 func tab(_ label: String, _ on: Bool, _ action: @escaping () -> Void) -> some View {
     Button(action: action) {
         VStack(spacing: 3) {
-            Text(label.uppercased()).font(.system(size: 10, weight: .semibold)).tracking(0.8)
+            Text(label.uppercased()).font(.system(size: 10, weight: .semibold)).tracking(0.6)
                 .foregroundColor(on ? accent : .secondary)
             Rectangle().fill(on ? accent : Color.clear).frame(height: 1.5)
         }
@@ -367,15 +501,9 @@ struct WidgetView: View {
 
     var pickedDay: Date? { store.pickedDay }
     var provider: String? { store.provider }
+    var scopeName: String { store.model ?? store.project ?? provider ?? "All providers" }
 
-    /// Selected range: a clicked day, or the preset ending today.
-    var range: (from: Date, to: Date, days: Int, title: String) {
-        if let d = pickedDay { return (d, d, 1, d.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())) }
-        return (daysAgo(store.preset.days - 1), today(), store.preset.days, store.preset.title)
-    }
-    var scopeName: String { store.model ?? provider ?? "All providers" }
-
-    /// Entries in [from, to] for the selected provider/model (all when nil).
+    /// Entries in [from, to) for the selected provider / model / project (all when nil).
     func scoped(_ r: Report, _ from: Date, _ to: Date) -> [Entry] {
         r.entries(from: from, to: to).filter {
             (provider == nil || $0.provider == provider) && (store.model == nil || $0.model == store.model)
@@ -413,7 +541,8 @@ struct WidgetView: View {
                 activity(r)
                 breakdown(r)
                 if !r.unpriced.isEmpty {
-                    Label("No price for \(r.unpriced.sorted().joined(separator: ", "))", systemImage: "exclamationmark.triangle")
+                    Label("No price for \(r.unpriced.sorted().joined(separator: ", ")) — add it in Settings › Pricing",
+                          systemImage: "exclamationmark.triangle")
                         .font(.caption2).foregroundColor(.orange)
                 }
             } else {
@@ -429,14 +558,14 @@ struct WidgetView: View {
     // MARK: header & filters
 
     var header: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             HStack(spacing: 6) {
                 Image(systemName: "chart.bar.fill").foregroundColor(accent)
-                Text("TOKENMETER").font(.system(size: 12, weight: .semibold).width(.expanded)).tracking(1.4)
+                Text("TOKENMETER").font(.system(size: 12, weight: .semibold).width(.expanded)).tracking(1.2)
             }
             .contentShape(Rectangle())
             .overlay(inPopover ? nil : DragHandle(menu: menu)) // desktop: drag to move, right-click for menu
-            Spacer()
+            Spacer(minLength: 4)
             ForEach(Preset.allCases) { p in
                 tab(p.rawValue, pickedDay == nil && store.preset == p) { store.preset = p; store.pickedDay = nil }
             }
@@ -495,7 +624,7 @@ struct WidgetView: View {
                 Section(g.0) { ForEach(g.1, id: \.self) { Text($0).tag(String?.some($0)) } }
             }
         }
-        .pickerStyle(.menu).labelsHidden().controlSize(.small).frame(maxWidth: 130)
+        .pickerStyle(.menu).labelsHidden().controlSize(.small).frame(maxWidth: 120)
     }
 
     // MARK: plan limits
@@ -525,9 +654,7 @@ struct WidgetView: View {
                             HStack(spacing: 6) {
                                 Text(m.label).foregroundColor(.secondary)
                                 Spacer()
-                                if let reset = m.resetsAt {
-                                    Text("resets \(relative(reset))").foregroundColor(.secondary)
-                                }
+                                if let reset = m.resetsAt { Text("resets \(relative(reset))").foregroundColor(.secondary) }
                                 Text("\(Int(m.percent.rounded()))%").fontWeight(.semibold)
                                     .foregroundColor(m.percent >= 70 ? quotaColor(m.percent) : .primary)
                                     .frame(minWidth: 34, alignment: .trailing)
@@ -545,11 +672,10 @@ struct WidgetView: View {
     // MARK: hero
 
     func hero(_ r: Report) -> some View {
-        let g = range
+        let g = store.span
         let es = scoped(r, g.from, g.to)
         let cur = sum(es)
-        let prev = sum(scoped(r, cal.date(byAdding: .day, value: -g.days, to: g.from)!,
-                              cal.date(byAdding: .day, value: -1, to: g.from)!))
+        let prev = sum(scoped(r, g.previous.from, g.previous.to))
         let inputSide = cur.input + cur.cacheRead + cur.cacheWrite
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -564,14 +690,16 @@ struct WidgetView: View {
                     let pct = (cur.cost - prev.cost) / prev.cost * 100
                     let c: Color = pct >= 0 ? .orange : .green
                     Text(pct >= 200 ? String(format: "▲ %.0f×", cur.cost / prev.cost)
-                         : String(format: "%@ %.0f%%", pct >= 0 ? "▲" : "▼", abs(pct)))
+                                     : String(format: "%@ %.0f%%", pct >= 0 ? "▲" : "▼", abs(pct)))
                         .font(.system(size: 10, weight: .semibold)).monospacedDigit().foregroundColor(c)
-                        .help("vs previous \(g.days == 1 ? "day" : "\(g.days) days")")
+                        .help("vs the previous \(g.days == 1 ? "day" : "\(g.days) days")")
                 }
             }
             Text(insight(es, cur, g.days)).font(.system(size: 12)).foregroundColor(.primary.opacity(0.85))
-            Text("\(tok(cur.tokens)) tokens · \(Int(cur.calls)) calls · at list price")
+            Text("\(tok(cur.tokens)) tokens · \(Int(cur.calls)) calls · \(duration(activeSeconds(es))) active")
                 .font(.system(size: 10.5)).foregroundColor(.secondary).monospacedDigit()
+                .help("Active time: 5-minute slots with at least one model call")
+            trend(r, g)
             Divider().opacity(0.6)
             HStack(alignment: .top, spacing: 10) {
                 mix("Input", cur.input, cur.tokens)
@@ -579,7 +707,7 @@ struct WidgetView: View {
                 mix("Cached", cur.cacheRead, cur.tokens)
                 mix("Writes", cur.cacheWrite, cur.tokens)
             }
-            cap("Cache hit \(inputSide > 0 ? String(format: "%.0f%%", cur.cacheRead / inputSide * 100) : "—") · saved \(usd(cur.saved))")
+            cap("Cache hit \(inputSide > 0 ? String(format: "%.0f%%", cur.cacheRead / inputSide * 100) : "—") · saved \(usd(cur.saved)) · list prices")
         }
         .card()
     }
@@ -604,6 +732,67 @@ struct WidgetView: View {
         return s
     }
 
+    /// Bars by hour (Today, 24H, a picked day) or by day; hover for values, click a day to focus it.
+    func trend(_ r: Report, _ g: Span) -> some View {
+        let n = g.hourly ? 24 : g.days
+        let start: (Int) -> Date = { i in
+            g.hourly ? g.from.addingTimeInterval(Double(i) * 3600) : cal.date(byAdding: .day, value: i, to: g.from)!
+        }
+        var slots = Array(repeating: Row(), count: n)
+        for e in scoped(r, g.from, g.to) {
+            let i = g.hourly ? Int(e.hour.timeIntervalSince(g.from) / 3600)
+                : cal.dateComponents([.day], from: g.from, to: e.day).day ?? -1
+            if i >= 0 && i < n { slots[i].add(e.row) }
+        }
+        let maxV = slots.map { $0.cost }.max() ?? 0
+        let hi = store.hover.flatMap { $0 < n ? $0 : nil }
+        let label: (Int) -> String = { i in g.hourly ? hourLabel(start(i)) : dayLabel(start(i)) }
+        let peak = slots.indices.max { slots[$0].cost < slots[$1].cost }
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                if let i = hi {
+                    cap("\(label(i)) · \(usd(slots[i].cost)) · \(tok(slots[i].tokens))")
+                } else {
+                    cap(g.hourly ? "By hour" : "By day")
+                    Spacer()
+                    if let p = peak, maxV > 0 { cap("Peak \(usd(maxV)) · \(label(p))") }
+                }
+                Spacer()
+            }
+            GeometryReader { geo in
+                HStack(alignment: .bottom, spacing: n > 40 ? 1 : 2) {
+                    ForEach(0..<n, id: \.self) { i in
+                        let v = slots[i].cost
+                        RoundedRectangle(cornerRadius: 1.5)
+                            .fill(v > 0 ? accent : Color.primary.opacity(0.15))
+                            .frame(height: v > 0 && maxV > 0 ? max(2, geo.size.height * v / maxV) : 2)
+                            .opacity(hi == nil || hi == i ? 1 : 0.4)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    }
+                }
+                .contentShape(Rectangle())
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active(let p): store.hover = min(n - 1, max(0, Int(p.x / geo.size.width * CGFloat(n))))
+                    case .ended: store.hover = nil
+                    }
+                }
+                .onTapGesture { loc in
+                    guard !g.hourly else { return }
+                    let i = min(n - 1, max(0, Int(loc.x / geo.size.width * CGFloat(n))))
+                    store.pickedDay = start(i)
+                }
+            }
+            .frame(height: 40)
+            HStack {
+                Text(label(0))
+                Spacer()
+                Text(label(n - 1))
+            }
+            .font(.system(size: 8.5)).foregroundColor(.secondary)
+        }
+    }
+
     func mix(_ label: String, _ v: Double, _ total: Double) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             cap(label)
@@ -621,13 +810,13 @@ struct WidgetView: View {
     func activity(_ r: Report) -> some View {
         let start = cal.date(byAdding: .day, value: -7 * (heatWeeks - 1),
                              to: cal.dateInterval(of: .weekOfYear, for: today())!.start)!
-        let daily = Dictionary(grouping: scoped(r, start, today()), by: { $0.day })
+        let daily = Dictionary(grouping: scoped(r, start, tomorrow()), by: { $0.day })
             .mapValues { $0.reduce(0) { $0 + $1.row.cost } }
         let maxV = daily.values.max() ?? 0
         let peak = daily.max { $0.value < $1.value }
-        let c7 = sum(scoped(r, daysAgo(6), today())).cost
-        let c30 = sum(scoped(r, daysAgo(29), today())).cost
-        let g = range
+        let c7 = sum(scoped(r, daysAgo(6), tomorrow())).cost
+        let c30 = sum(scoped(r, daysAgo(29), tomorrow())).cost
+        let g = store.span
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 cap("Activity · \(heatWeeks) weeks")
@@ -645,16 +834,13 @@ struct WidgetView: View {
                             .fixedSize().frame(height: 10)
                         ForEach(0..<7, id: \.self) { d in
                             let day = cal.date(byAdding: .day, value: 7 * w + d, to: start)!
-                            dot(day, daily[day] ?? 0, maxV, day >= g.from && day <= g.to)
+                            dot(day, daily[day] ?? 0, maxV, day >= g.from && day < g.to)
                         }
                     }
                     .frame(maxWidth: .infinity)
                 }
             }
-            HStack {
-                cap("Dot size = cost that day")
-                Spacer()
-            }
+            cap("Dot size = cost that day · click to focus")
             Divider().opacity(0.6)
             HStack(spacing: 0) {
                 stat("Last 7 days", usd(c7))
@@ -691,12 +877,11 @@ struct WidgetView: View {
     // MARK: breakdown
 
     func breakdown(_ r: Report) -> some View {
-        let g = range
+        let g = store.span
         let es = scoped(r, g.from, g.to)
         let cur = sum(es)
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-
                 tab("Provider", store.mode == "provider") { store.mode = "provider" }
                 tab("Model", store.mode == "model") { store.mode = "model" }
                 tab("Project", store.mode == "project") { store.mode = "project" }
@@ -706,7 +891,7 @@ struct WidgetView: View {
             if es.isEmpty {
                 Text("No usage in this period").font(.caption).foregroundColor(.secondary)
             } else if store.mode == "day" {
-                days(r)
+                days(r, g)
             } else {
                 let byProvider = store.mode == "provider", byProject = store.mode == "project"
                 let groups = Dictionary(grouping: es, by: { byProvider ? $0.provider : byProject ? ($0.project.isEmpty ? "?" : $0.project) : $0.model })
@@ -763,10 +948,12 @@ struct WidgetView: View {
     }
 
     /// Daily table for the selected range, newest first; click a row to focus that day.
-    func days(_ r: Report) -> some View {
-        let g = range
-        let rows = (0..<g.days).map { cal.date(byAdding: .day, value: -$0, to: g.to)! }
-            .map { d in (day: d, row: sum(scoped(r, d, d))) }
+    func days(_ r: Report, _ g: Span) -> some View {
+        let first = cal.startOfDay(for: g.from), last = cal.startOfDay(for: g.to.addingTimeInterval(-1))
+        let count = (cal.dateComponents([.day], from: first, to: last).day ?? 0) + 1
+        let rows = (0..<count).map { cal.date(byAdding: .day, value: -$0, to: last)! }.map { d in
+            (day: d, row: sum(scoped(r, max(d, g.from), min(cal.date(byAdding: .day, value: 1, to: d)!, g.to))))
+        }
         return VStack(spacing: 0) {
             HStack { cap("Date"); Spacer(); cap("Tokens").frame(width: 70, alignment: .trailing); cap("Cost").frame(width: 64, alignment: .trailing) }
                 .padding(.bottom, 6)
@@ -814,6 +1001,45 @@ struct WidgetView: View {
     }
 }
 
+// MARK: - Settings
+
+struct SettingsView: View {
+    @ObservedObject var prefs: Prefs
+
+    var body: some View {
+        Form {
+            Section("Menu bar") {
+                Picker("Show", selection: $prefs.menuBarFormat) {
+                    ForEach(menuBarFormats, id: \.1) { Text($0.0).tag($0.1) }
+                }
+                Picker("Plan limit alert", selection: $prefs.alertThreshold) {
+                    ForEach(alertThresholds, id: \.1) { Text($0.0).tag($0.1) }
+                }
+                Text("From this level the fullest plan limit appears next to the cost, in orange, and red from 90%.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            Section("General") {
+                Toggle("Launch at login", isOn: $prefs.launchAtLogin)
+                Toggle("Show widget on desktop", isOn: $prefs.showDesktopWidget)
+            }
+            Section("Pricing") {
+                Text("Costs are estimated at API list prices. Override or add models in ~/.config/tokenmeter/prices.json (USD per 1M tokens: input, output, cache read, cache write 5m, cache write 1h). The CLI reads the same file.")
+                    .font(.caption).foregroundColor(.secondary)
+                Button("Edit Prices…") { openPricesFile() }
+            }
+            Section("About") {
+                Text("TokenMeter \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev") reads the logs Claude Code and Codex write on this Mac. Nothing is uploaded.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 440)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+// MARK: - Window helpers
+
 /// Transparent strip: drag to move the window, right-click for the menu.
 struct DragHandle: NSViewRepresentable {
     let menu: NSMenu
@@ -841,10 +1067,12 @@ final class WidgetWindow: NSWindow {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let store = Store()
+    let prefs = Prefs.shared
     var window: NSWindow!
     var statusItem: NSStatusItem!
     var hosting: NSView!
     let popover = NSPopover()
+    var settingsWindow: NSWindow?
     var sizeSub: AnyCancellable?
     let menu = NSMenu()
 
@@ -867,6 +1095,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.setStatusTitle(r)
             self?.snapshotIfRequested()
         }
+        prefs.onChange = { [weak self] in self?.applyPrefs() }
         // Any data or selection change can change the content height.
         sizeSub = store.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.fit() }
@@ -906,43 +1135,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window.setFrameTopLeftPoint(NSPoint(x: screen.maxX - 380, y: screen.maxY - 40))
         }
         window.setFrameAutosaveName(name)
-        if UserDefaults.standard.bool(forKey: "showDesktopWidget") || CommandLine.arguments.contains("--snapshot") {
-            window.orderFront(nil)
+        if prefs.showDesktopWidget || CommandLine.arguments.contains("--snapshot") { window.orderFront(nil) }
+    }
+
+    func applyPrefs() {
+        if let r = store.report { setStatusTitle(r) }
+        if prefs.showDesktopWidget != window.isVisible {
+            if prefs.showDesktopWidget { window.orderFront(nil) } else { window.orderOut(nil) }
         }
     }
 
-    /// Menu bar: today's cost, plus the fullest plan limit once one passes 80%.
+    /// Menu bar title per Settings, plus the fullest plan limit once it passes the alert threshold.
     func setStatusTitle(_ r: Report) {
-        var title = usd(r.total(from: today(), to: today()).cost)
+        let t = r.total(from: today(), to: tomorrow())
+        let q = r.fullestQuota
+        let qText = q.map { "\($0.product) \(Int($0.peak.rounded()))%" }
+        var title: String
+        switch prefs.menuBarFormat {
+        case "tokens": title = tok(t.tokens)
+        case "both": title = "\(usd(t.cost)) · \(tok(t.tokens))"
+        case "quota": title = qText ?? usd(t.cost)
+        default: title = usd(t.cost)
+        }
         var attrs: [NSAttributedString.Key: Any] = [:]
-        if let q = r.quotas.max(by: { $0.peak < $1.peak }), q.peak >= 80 {
-            title += " · \(q.product) \(Int(q.peak.rounded()))%"
+        if let q = q, let qText = qText, prefs.alertThreshold > 0, q.peak >= Double(prefs.alertThreshold) {
+            if prefs.menuBarFormat != "quota" { title += " · \(qText)" }
             attrs[.foregroundColor] = q.peak >= 90 ? NSColor.systemRed : NSColor.systemOrange
         }
         statusItem.button?.attributedTitle = NSAttributedString(string: title, attributes: attrs)
     }
 
-    /// Debug: `TokenMeter --snapshot out.png [today|week|month|dayN] [--popover]` renders the widget to a PNG and quits.
+    /// Debug: `TokenMeter --snapshot out.png [today|24h|week|month|90d|dayN] [--popover] [provider=…] [model=…]
+    /// [project=…] [mode=…] [hover=N] [--settings]` renders the panel (or Settings) to a PNG and quits.
     func snapshotIfRequested() {
         let args = CommandLine.arguments
         guard let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count else { return }
         let mode = i + 2 < args.count ? args[i + 2] : "today"
         if mode.hasPrefix("day"), let n = Int(mode.dropFirst(3)) { store.pickedDay = daysAgo(n) }
-        else { store.preset = mode == "week" ? .week : mode == "month" ? .month : .today }
-        if let t = args.first(where: { $0.hasPrefix("provider=") }) { store.provider = String(t.dropFirst(9)) }
-        if let m = args.first(where: { $0.hasPrefix("model=") }) { store.model = String(m.dropFirst(6)) }
-        if let m = args.first(where: { $0.hasPrefix("mode=") }) { store.mode = String(m.dropFirst(5)) }
-        if let m = args.first(where: { $0.hasPrefix("project=") }) { store.project = String(m.dropFirst(8)) }
+        else { store.preset = ["24h": .h24, "week": .week, "month": .month, "90d": .quarter][mode] ?? .today }
+        let arg: (String) -> String? = { k in args.first { $0.hasPrefix(k + "=") }.map { String($0.dropFirst(k.count + 1)) } }
+        if let v = arg("provider") { store.provider = v }
+        if let v = arg("model") { store.model = v }
+        if let v = arg("mode") { store.mode = v }
+        if let v = arg("project") { store.project = v }
+        if let v = arg("hover") { store.hover = Int(v) }
         window.contentView?.layer?.backgroundColor = NSColor(white: 0.13, alpha: 1).cgColor
-        if args.contains("--popover"), let blur = window.contentView {
+        if let blur = window.contentView, args.contains("--popover") || args.contains("--settings") {
             hosting.removeFromSuperview()
-            hosting = ClickThroughHostingView(rootView: WidgetView(store: store, menu: menu, inPopover: true))
+            hosting = args.contains("--settings")
+                ? ClickThroughHostingView(rootView: AnyView(SettingsView(prefs: prefs)))
+                : ClickThroughHostingView(rootView: AnyView(WidgetView(store: store, menu: menu, inPopover: true)))
             hosting.frame = blur.bounds
             hosting.autoresizingMask = [.width, .height]
             blur.addSubview(hosting)
             fit()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            self.fit()
             guard let v = self.window.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { exit(1) }
             v.cacheDisplay(in: v.bounds, to: rep)
             try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[i + 1]))
@@ -962,14 +1211,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         if let r = store.report {
-            let t = r.total(from: today(), to: today()).cost
-            let m = r.total(from: daysAgo(29), to: today()).cost
+            let t = r.total(from: today(), to: tomorrow()).cost
+            let m = r.total(from: daysAgo(29), to: tomorrow()).cost
             menu.addItem(withTitle: "Today \(usd(t)) · 30 days \(usd(m))", action: nil, keyEquivalent: "")
+            if let q = r.fullestQuota { menu.addItem(withTitle: "\(q.product) plan \(Int(q.peak.rounded()))% used", action: nil, keyEquivalent: "") }
             menu.addItem(.separator())
         }
         add(menu, "Refresh", #selector(refresh), "r")
-        add(menu, "Show on Desktop", #selector(toggleWidget), "", on: window.isVisible)
-        add(menu, "Launch at Login", #selector(toggleLogin), "", on: SMAppService.mainApp.status == .enabled)
+        menu.addItem(submenu("Menu Bar Shows", menuBarFormats.map { ($0.0, $0.1 as Any, prefs.menuBarFormat == $0.1) }, #selector(setFormat(_:))))
+        menu.addItem(submenu("Plan Limit Alert", alertThresholds.map { ($0.0, $0.1 as Any, prefs.alertThreshold == $0.1) }, #selector(setThreshold(_:))))
+        add(menu, "Show on Desktop", #selector(toggleWidget), "", on: prefs.showDesktopWidget)
+        add(menu, "Launch at Login", #selector(toggleLogin), "", on: prefs.launchAtLogin)
+        add(menu, "Settings…", #selector(openSettings), ",")
         menu.addItem(.separator())
         add(menu, "Quit TokenMeter", #selector(NSApplication.terminate(_:)), "q")
     }
@@ -980,7 +1233,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.state = on ? .on : .off
     }
 
+    func submenu(_ title: String, _ items: [(String, Any, Bool)], _ sel: Selector) -> NSMenuItem {
+        let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for (t, value, on) in items {
+            let item = sub.addItem(withTitle: t, action: sel, keyEquivalent: "")
+            item.target = self
+            item.representedObject = value
+            item.state = on ? .on : .off
+        }
+        parent.submenu = sub
+        return parent
+    }
+
     @objc func refresh() { store.refresh() }
+    @objc func setFormat(_ item: NSMenuItem) { if let v = item.representedObject as? String { prefs.menuBarFormat = v } }
+    @objc func setThreshold(_ item: NSMenuItem) { if let v = item.representedObject as? Int { prefs.alertThreshold = v } }
+    @objc func toggleWidget() { prefs.showDesktopWidget.toggle() }
+    @objc func toggleLogin() { prefs.launchAtLogin.toggle() }
+
+    @objc func openSettings() {
+        if settingsWindow == nil {
+            let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(prefs: prefs)))
+            w.title = "TokenMeter Settings"
+            w.styleMask = [.titled, .closable]
+            w.isReleasedWhenClosed = false
+            settingsWindow = w
+        }
+        popover.performClose(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.center()
+        settingsWindow?.makeKeyAndOrderFront(nil)
+    }
 
     /// Left click: usage panel. Right click: menu.
     @objc func statusClicked() {
@@ -995,23 +1279,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let r = store.report, Date().timeIntervalSince(r.updated) > 60 { store.refresh() }
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
-        }
-    }
-
-    @objc func toggleWidget() {
-        if window.isVisible { window.orderOut(nil) } else { window.orderFront(nil) }
-        UserDefaults.standard.set(window.isVisible, forKey: "showDesktopWidget")
-    }
-
-    @objc func toggleLogin() {
-        let svc = SMAppService.mainApp
-        do {
-            if svc.status == .enabled { try svc.unregister() } else { try svc.register() }
-        } catch {
-            let a = NSAlert()
-            a.messageText = "Could not change login item"
-            a.informativeText = "\(error.localizedDescription)\nMove TokenMeter.app to /Applications and try again."
-            a.runModal()
         }
     }
 }

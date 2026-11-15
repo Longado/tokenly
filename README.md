@@ -16,10 +16,11 @@ python3 tokenmeter.py
 ## Usage
 
 ```bash
-tokenmeter                 # last 30 days, grouped by day / model / project
+tokenmeter                 # last 30 days, grouped by day / provider / model / project
 tokenmeter 7               # last 7 days
-tokenmeter --by model      # one grouping: day | model | project | all
-tokenmeter --json          # machine-readable output
+tokenmeter --by provider   # one grouping: day | provider | model | project | all
+tokenmeter --quota         # plan limits (Claude, Codex) as last recorded locally
+tokenmeter --json          # machine-readable output (also with --quota)
 ```
 
 ```
@@ -39,6 +40,11 @@ today's cost; click it for the usage panel, right-click for the menu. It refresh
 - Plan limits: Claude and Codex subscription windows (5h / 7d) as the tools last recorded them locally,
   with reset times; the menu bar flags any limit above 80%.
 - Projects: breakdown by project (working directory) and a project filter.
+- Ranges: Today / 24H / 7D / 30D / 90D, or click any day. Today, 24H and single days chart by hour.
+- Trend strip under the headline number: hover a bar for its cost and tokens, click a day bar to focus it.
+- Active time: 5-minute slots with at least one model call.
+- Settings window (menu → Settings…): menu bar format (cost / tokens / both / fullest plan limit),
+  plan limit alert threshold, launch at login, desktop widget, and Edit Prices….
 - Hero: cost for the range, change vs the previous period, a one-line takeaway
   ("$0.79 a day. Anthropic took 94% of it."), and the token mix (input / output / cached / cache writes).
 - Filters: provider (All / Anthropic / OpenAI / Google, derived from the model name) and a model dropdown grouped by provider.
@@ -55,7 +61,7 @@ macos/build.sh            # -> macos/build/TokenMeter.app
 cp -R macos/build/TokenMeter.app /Applications/
 ```
 
-`TokenMeter --snapshot out.png [today|week|month|dayN] [--popover] [provider=OpenAI] [model=gpt-6.1-sol] [project=name] [mode=provider|model|project|day]` renders the panel to a PNG (for development).
+`TokenMeter --snapshot out.png [today|24h|week|month|90d|dayN] [--popover|--settings] [hover=N] [provider=OpenAI] [model=gpt-6.1-sol] [project=name] [mode=provider|model|project|day]` renders the panel to a PNG (for development).
 
 Prices are in `macos/main.swift` (`prices`) and `tokenmeter.py` (`PRICES`); keep them in sync.
 
@@ -69,9 +75,16 @@ Prices are in `macos/main.swift` (`prices`) and `tokenmeter.py` (`PRICES`); keep
 ## Pricing
 
 Costs are **API list-price equivalents**, not what a subscription actually charges.
-Prices live in the `PRICES` dict at the top of `tokenmeter.py` (USD per 1M tokens:
-input, output, cache read, cache write 5m, cache write 1h). Models without a price
-are counted as $0 and listed at the end of the output — PRs welcome.
+Defaults live in `PRICES` (`tokenmeter.py`) and `defaultPrices` (`macos/main.swift`); a test keeps them identical.
+Override prices or add models in `~/.config/tokenmeter/prices.json`, read by both the app and the CLI
+(USD per 1M tokens: input, output, cache read, cache write 5m, cache write 1h):
+
+```json
+{ "my-model": [1.0, 5.0, 0.1, 1.25, 2.0] }
+```
+
+Model names are normalized first (router prefixes, `[1m]` context tags, date snapshots and, when that matches a
+priced model, effort suffixes are dropped), so variants of one model share a price and a row.
 
 ## Development
 

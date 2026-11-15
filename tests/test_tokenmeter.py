@@ -27,6 +27,7 @@ class TokenmeterTest(unittest.TestCase):
         root = self.tmp.name
         os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(root, "claude")
         os.environ["CODEX_HOME"] = os.path.join(root, "codex")
+        tokenmeter.OVERRIDE = os.path.join(root, "no-prices.json")  # ignore the real user override
         msg = {"timestamp": NOW, "requestId": "r1", "cwd": "/x/proj-a",
                "message": {"id": "m1", "model": "claude-opus-5-5", "usage": {
                    "input_tokens": 1_000_000, "output_tokens": 1_000_000,
@@ -38,7 +39,10 @@ class TokenmeterTest(unittest.TestCase):
             {"timestamp": NOW, "type": "turn_context", "payload": {"model": "gpt-6.1-sol", "cwd": "/y/proj-b"}},
             {"timestamp": NOW, "type": "event_msg", "payload": {"type": "token_count", "info": {
                 "last_token_usage": {"input_tokens": 3_000_000, "cached_input_tokens": 2_000_000,
-                                     "output_tokens": 1_000_000}}}},
+                                     "output_tokens": 1_000_000}},
+                "rate_limits": {"plan_type": "pro", "primary": {"used_percent": 42.0, "window_minutes": 10080,
+                                "resets_at": 4102444800}, "secondary": {"used_percent": 99.0, "window_minutes": 300,
+                                "resets_at": 946684800}}}},
             {"timestamp": "2000-01-01T00:00:00Z", "type": "event_msg", "payload": {"type": "token_count",
                 "info": {"last_token_usage": {"input_tokens": 9, "output_tokens": 9}}}},
         ])
@@ -54,6 +58,22 @@ class TokenmeterTest(unittest.TestCase):
         # codex: 1M uncached input * 2 + 1M output * 10 + 2M cached * 0.1; old event ignored
         self.assertEqual(m["codex:gpt-6.1-sol"][:4], [1_000_000, 1_000_000, 2_000_000, 0])
         self.assertAlmostEqual(m["codex:gpt-6.1-sol"][4], 12.2)
+
+    def test_providers(self):
+        p = tokenmeter.collect(30).groups["provider"]
+        self.assertEqual(sorted(p), ["Anthropic", "OpenAI"])
+        self.assertAlmostEqual(p["Anthropic"][4], 37.2)
+
+    def test_quota(self):
+        with open(os.path.join(self.tmp.name, "claude", ".claude.json"), "w") as f:
+            json.dump({"cachedUsageUtilization": {"utilization": {
+                "five_hour": None,
+                "seven_day": {"utilization": 88, "resets_at": "2100-01-01T00:00:00.123456+00:00"},
+                "seven_day_opus": {"utilization": 50, "resets_at": "2000-01-01T00:00:00+00:00"}}}}, f)
+        qs = {p: (plan, ms) for p, plan, ms in tokenmeter.quotas()}
+        self.assertEqual([(l, v) for l, v, _ in qs["Claude"][1]], [("7d", 88.0)])  # expired window dropped
+        self.assertEqual(qs["Codex"][0], "Pro")
+        self.assertEqual([(l, v) for l, v, _ in qs["Codex"][1]], [("7d", 42.0)])
 
     def test_projects(self):
         p = tokenmeter.collect(30).groups["project"]

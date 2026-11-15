@@ -25,6 +25,26 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.11.0 — analysis depth and settings (P1 complete, P2 mostly complete)
+- **Ranges.** Today / 24H (rolling, distinct from Today) / 7D / 30D / 90D. Data is now kept per local hour, and the scan window grew to 182 days so 90D has a previous period to compare against.
+- **Trend strip.** Bars under the headline number:
+  - 24 hourly bars for Today, 24H and a picked day; daily bars for 7D / 30D / 90D.
+  - Hover shows that slot's cost and tokens, using one hover region per chart.
+  - Clicking a daily bar focuses that day. Activity dots keep their tooltips.
+- **Active time.** Distinct 5-minute slots with at least one model call, unioned across sessions so parallel sessions don't double count.
+- **Menu bar format.** Today's cost / today's tokens / cost + tokens / fullest plan limit.
+  - Configurable plan-limit alert (off / 70 / 80 / 90%): the fullest limit is appended in orange, or red from 90%.
+  - Available from the right-click menu and from Settings.
+- **Settings window.** Menu bar format, alert threshold, launch at login, desktop widget, Edit Prices….
+- **Shared price table.**
+  - `~/.config/tokenmeter/prices.json` overrides or adds models for both the app and the CLI.
+  - The app rescans when prices change, since costs are computed while parsing.
+  - `tests/test_prices.py` keeps the Swift and Python defaults identical.
+- **Model names.** Router prefixes, `[1m]`-style tags, Bedrock/Vertex prefixes and version suffixes, and date snapshots are dropped. Effort suffixes are dropped only when the result is a priced model. Long names truncate in the middle with a tooltip.
+- **CLI parity (v0.3.0).**
+  - `--by provider`, `--quota` (also with `--json`), price override, and model normalization.
+  - The test suite grew from 4 to 11 tests.
+
 ### v0.10.0 — plan limits, projects, incremental scanning
 - **Plan limits card**
   - Claude: `cachedUsageUtilization` in `~/.claude.json` (5h / 7d / 7d Opus / 7d Sonnet, reset times).
@@ -51,20 +71,15 @@ CLI, pricing, macOS app, menu bar popover, provider + model filters.
 
 ## Next
 
-### P1 — analysis depth
-1. **Hourly view for Today.** 24 hourly slots, starting at local midnight. Hover shows tokens and cost for that hour.
-2. **Hover values** on activity dots and bars, with one hover region per chart rather than one per element.
-3. **Active time.** Sum of gaps between consecutive calls that are shorter than 5 minutes, shown per range.
-4. **Menu bar format setting.** Choose cost, tokens, or fullest quota %, with the alert threshold configurable.
-5. **More ranges.** 24H (rolling, deliberately distinct from Today) and 90D. The scan window grows to cover 90D plus its delta.
+### Blocked
+- **More sources: OpenCode, Gemini CLI.** Neither is installed on the development Mac, so their log formats can't be verified. Add them once real data is available.
+- **Auto-update (Sparkle).** Needs a Developer ID signature first. The app is ad-hoc signed today.
 
-### P2 — product polish
-6. **Settings window.** Menu bar format, launch at login, show desktop widget, alert threshold, price overrides.
-7. **Single price table.** `prices.json` (bundled default plus a user override at `~/.config/tokenmeter/prices.json`), shared by the app and `tokenmeter.py`.
-8. **Model names.** Merge variants of the same model (effort suffixes, router prefixes, context sizes) and truncate long names in the middle with a tooltip.
-9. **More sources.** OpenCode (`~/.local/share/opencode`) and Gemini CLI, once their usage formats are confirmed.
-10. **CLI parity.** `tokenmeter --quota` and `--by provider`.
-11. **Auto-update (Sparkle).** Only after the app has a Developer ID signature.
+### Ideas (not planned yet)
+- Budget alerts: a daily or monthly spending limit with a system notification.
+- Per-project budgets and a "this week vs last week" digest notification.
+- Export a range to CSV from the Day tab.
+- Intel test run. The universal binary builds, but it has only been run on Apple silicon.
 
 ### Engineering notes
 - Claude messages are deduplicated by `message.id + requestId` across all files, kept in memory for the app's lifetime.
@@ -72,5 +87,5 @@ CLI, pricing, macOS app, menu bar popover, provider + model filters.
 - Quota data is whatever the tool last cached locally. TokenMeter never calls provider APIs or reads credentials.
 - UI self-check:
   ```
-  TokenMeter --snapshot out.png [today|week|month|dayN] [--popover] [provider=…] [model=…] [project=…] [mode=…]
+  TokenMeter --snapshot out.png [today|24h|week|month|90d|dayN] [--popover|--settings] [provider=…] [model=…] [project=…] [mode=…] [hover=N]
   ```
