@@ -159,6 +159,7 @@ final class Store: ObservableObject {
     @Published var preset = Preset.today
     @Published var pickedDay: Date?
     @Published var tool: String? // nil = all tools
+    @Published var model: String? // nil = all models
     var onUpdate: ((Report) -> Void)?
     func refresh() {
         DispatchQueue.global(qos: .utility).async {
@@ -193,7 +194,7 @@ struct WidgetView: View {
 
     /// Entries in [from, to] for the selected tool (all tools when nil).
     func scoped(_ r: Report, _ from: Date, _ to: Date) -> [Entry] {
-        r.entries(from: from, to: to).filter { tool == nil || $0.tool == tool }
+        r.entries(from: from, to: to).filter { (tool == nil || $0.tool == tool) && (store.model == nil || $0.model == store.model) }
     }
     func sum(_ es: [Entry]) -> Row { es.reduce(into: Row()) { $0.add($1.row) } }
 
@@ -248,7 +249,7 @@ struct WidgetView: View {
 
     func chip(_ label: String, _ value: String?, _ color: Color) -> some View {
         let on = store.tool == value
-        return Button { store.tool = value } label: {
+        return Button { store.tool = value; store.model = nil } label: {
             HStack(spacing: 5) {
                 if value != nil { Circle().fill(color).frame(width: 6, height: 6) }
                 Text(label)
@@ -373,36 +374,56 @@ struct WidgetView: View {
     func breakdown(_ r: Report) -> some View {
         let g = range
         let es = scoped(r, g.from, g.to)
-        let total = sum(es).cost
-        // All tools: one row per tool (click to filter). One tool: one row per model.
-        let rows: [(name: String, color: Color, row: Row, tool: String?)] = tool == nil
-            ? tools.map { t in (t.name, t.color, sum(es.filter { $0.tool == t.name }), t.name) }
-            : Dictionary(grouping: es, by: { $0.model })
-                .map { ($0.key, toolColor(tool!), sum($0.value), nil as String?) }
-                .sorted { $0.row.cost > $1.row.cost }
+        let cur = sum(es)
+        typealias Item = (name: String, color: Color, value: Double, right: String, select: () -> Void)
+        let items: [Item]
+        let title: String
+        if store.model != nil {
+            // One model: what its tokens are made of.
+            title = "TOKEN MIX"
+            let c = toolColor(es.first?.tool ?? tool ?? "")
+            items = [("Input", cur.input), ("Output", cur.output), ("Cache read", cur.cacheRead), ("Cache write", cur.cacheWrite)]
+                .map { p in (p.0, c, cur.tokens > 0 ? p.1 / cur.tokens : 0, tok(p.1), {}) }
+        } else if let t = tool {
+            title = "BY MODEL"
+            items = Dictionary(grouping: es, by: { $0.model }).map { kv in
+                let row = sum(kv.value)
+                return (kv.key, toolColor(t), cur.cost > 0 ? row.cost / cur.cost : 0,
+                        r.unpriced.contains(kv.key) ? "—" : usd(row.cost), { store.model = kv.key })
+            }.sorted { $0.value > $1.value }
+        } else {
+            title = "BY TOOL"
+            items = tools.map { t in
+                let row = sum(es.filter { $0.tool == t.name })
+                return (t.name, t.color, cur.cost > 0 ? row.cost / cur.cost : 0, usd(row.cost), { store.tool = t.name })
+            }
+        }
         return VStack(alignment: .leading, spacing: 10) {
-            Text(tool == nil ? "BY TOOL" : "BY MODEL").font(.system(size: 10, weight: .semibold)).tracking(0.8)
-                .foregroundColor(.secondary)
-            if rows.isEmpty {
+            HStack {
+                Text(title).font(.system(size: 10, weight: .semibold)).tracking(0.8).foregroundColor(.secondary)
+                Spacer()
+                modelPicker(r)
+            }
+            if es.isEmpty {
                 Text("No usage in this period").font(.caption).foregroundColor(.secondary)
             }
-            ForEach(rows, id: \.name) { item in
-                Button { if let t = item.tool { store.tool = t } } label: {
+            ForEach(items, id: \.name) { item in
+                Button(action: item.select) {
                     VStack(spacing: 5) {
                         HStack(spacing: 6) {
-                            if item.tool != nil { Circle().fill(item.color).frame(width: 7, height: 7) }
+                            if title == "BY TOOL" { Circle().fill(item.color).frame(width: 7, height: 7) }
                             Text(item.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
                             Spacer()
-                            Text(tok(item.row.tokens)).font(.caption).foregroundColor(.secondary).monospacedDigit()
-                            Text(r.unpriced.contains(item.name) ? "—" : usd(item.row.cost))
+                            Text(String(format: "%.0f%%", item.value * 100))
+                                .font(.caption).foregroundColor(.secondary).monospacedDigit()
+                            Text(item.right)
                                 .font(.system(size: 12, weight: .semibold, design: .rounded)).monospacedDigit()
                                 .frame(minWidth: 58, alignment: .trailing)
                         }
                         GeometryReader { geo in
                             ZStack(alignment: .leading) {
                                 Capsule().fill(Color.primary.opacity(0.08))
-                                Capsule().fill(item.color)
-                                    .frame(width: max(0, geo.size.width * (total > 0 ? item.row.cost / total : 0)))
+                                Capsule().fill(item.color).frame(width: max(0, geo.size.width * item.value))
                             }
                         }
                         .frame(height: 4)
@@ -412,6 +433,19 @@ struct WidgetView: View {
                 .buttonStyle(.plain)
             }
         }
+    }
+
+    /// Dropdown of every model seen for the current tool; picking one filters the whole panel.
+    func modelPicker(_ r: Report) -> some View {
+        let models = Dictionary(grouping: r.entries.filter { tool == nil || $0.tool == tool }, by: { $0.model })
+            .mapValues { $0.reduce(0) { $0 + $1.row.cost } }
+            .sorted { $0.value > $1.value }.map { $0.key }
+        return Picker("", selection: Binding(get: { store.model }, set: { store.model = $0 })) {
+            Text("All models").tag(String?.none)
+            Divider()
+            ForEach(models, id: \.self) { Text($0).tag(String?.some($0)) }
+        }
+        .pickerStyle(.menu).labelsHidden().controlSize(.small).fixedSize()
     }
 
     var footer: some View {
@@ -536,6 +570,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if mode.hasPrefix("day"), let n = Int(mode.dropFirst(3)) { store.pickedDay = daysAgo(n) }
         else { store.preset = mode == "week" ? .week : mode == "month" ? .month : .today }
         if let t = args.first(where: { $0.hasPrefix("tool=") }) { store.tool = String(t.dropFirst(5)) }
+        if let m = args.first(where: { $0.hasPrefix("model=") }) { store.model = String(m.dropFirst(6)) }
         window.contentView?.layer?.backgroundColor = NSColor(white: 0.13, alpha: 1).cgColor
         if args.contains("--popover"), let blur = window.contentView {
             hosting.removeFromSuperview()

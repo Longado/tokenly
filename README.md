@@ -40,7 +40,8 @@ today's cost; click it for the usage panel, right-click for the menu. It refresh
 - Range switch: Today / 7D / 30D, with change vs the previous period.
 - 30-day daily cost chart (stacked by tool, dashed daily average); click a bar to see that day.
 - Stat tiles: average per day, peak day, cache hit rate, money saved by cache reads.
-- Breakdown by tool (click a tool to filter) or, with a tool selected, by model.
+- Model dropdown: pick one model to filter the whole panel and see its token mix (input / output / cache read / cache write).
+- Breakdown by tool (click a tool to filter) or, with a tool selected, by model (click a model to select it).
 - Optional desktop widget (menu → Show on Desktop); drag its header to move it.
 - Menu: Refresh, Show on Desktop, Launch at Login, Quit.
 
@@ -52,7 +53,7 @@ macos/build.sh            # -> macos/build/TokenMeter.app
 cp -R macos/build/TokenMeter.app /Applications/
 ```
 
-`TokenMeter --snapshot out.png [today|week|month|dayN] [--popover] [tool=Codex]` renders the panel to a PNG (for development).
+`TokenMeter --snapshot out.png [today|week|month|dayN] [--popover] [tool=Codex] [model=gpt-6.1-sol]` renders the panel to a PNG (for development).
 
 Prices are in `macos/main.swift` (`prices`) and `tokenmeter.py` (`PRICES`); keep them in sync.
 
