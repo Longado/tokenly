@@ -36,7 +36,10 @@ TOTAL                      2,001,200     370,000    48,000,000     900,000    51
 `TokenMeter.app` is a native, dependency-free macOS app (13+) that shows a translucent
 widget on the desktop and today's cost in the menu bar. It refreshes every 5 minutes and on wake.
 
-- Drag the widget anywhere; the position is remembered.
+- Range switch: Today / 7 Days / 30 Days, with change vs the previous period and money saved by cache reads.
+- 30-day daily cost chart, stacked by tool; click a bar to see that day.
+- Breakdown by tool (Claude Code, Codex) and by model.
+- Drag the header to move the widget; the position is remembered.
 - Menu bar / right-click menu: Refresh, Show Widget, Launch at Login, Quit.
 
 Download `TokenMeter.zip` from Releases, unzip, move to `/Applications`. The app is ad-hoc
@@ -46,6 +49,8 @@ signed, so the first launch needs right-click → Open. Or build it yourself (Xc
 macos/build.sh            # -> macos/build/TokenMeter.app
 cp -R macos/build/TokenMeter.app /Applications/
 ```
+
+`TokenMeter --snapshot out.png [today|week|month|dayN]` renders the widget to a PNG (for development).
 
 Prices are in `macos/main.swift` (`prices`) and `tokenmeter.py` (`PRICES`); keep them in sync.
 
