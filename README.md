@@ -51,7 +51,7 @@ today's cost; click it for the usage panel, right-click for the menu. It refresh
 - Trend strip under the headline number: hover a bar for its cost and tokens, click a day bar to focus it.
 - Active time: 5-minute slots with at least one model call.
 - Settings window (menu → Settings…): menu bar format (cost / tokens / both / fullest plan limit),
-  plan limit alert threshold, launch at login, desktop widget, and Edit Prices….
+  plan limit alert threshold, text size (Default / Large / Larger), launch at login, desktop widget, and Edit Prices….
 - Hero: cost for the range, change vs the previous period, a one-line takeaway
   ("$0.79 a day. Anthropic took 94% of it."), and the token mix (input / output / cached / cache writes).
 - Filters: provider (All / Anthropic / OpenAI / Google, derived from the model name) and a model dropdown grouped by provider.

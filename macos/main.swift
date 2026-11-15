@@ -506,6 +506,8 @@ final class Prefs: ObservableObject {
     /// Read-only import of the user's other devices from their Vibe Usage account.
     @Published var includeOtherDevices: Bool { didSet { ud.set(includeOtherDevices, forKey: "includeOtherDevices"); onDataChange?() } }
     var onDataChange: (() -> Void)?
+    /// Panel text size: 1.0 default, 1.15 large, 1.3 larger.
+    @Published var textScale: CGFloat { didSet { ud.set(Double(textScale), forKey: "textScale"); onChange?() } }
     @Published var launchAtLogin: Bool {
         didSet {
             let svc = SMAppService.mainApp
@@ -527,6 +529,7 @@ final class Prefs: ObservableObject {
         alertThreshold = ud.object(forKey: "alertThreshold") as? Int ?? 80
         showDesktopWidget = ud.bool(forKey: "showDesktopWidget")
         includeOtherDevices = ud.bool(forKey: "includeOtherDevices")
+        textScale = CGFloat(ud.object(forKey: "textScale") as? Double ?? 1.15)
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 }
@@ -595,11 +598,15 @@ final class Store: ObservableObject {
 // MARK: - Widget UI
 
 let accent = Color(red: 0.67, green: 0.58, blue: 1.0)
+
+/// Text size from Settings; the panel widens with it so rows don't truncate.
+func fs(_ size: CGFloat) -> CGFloat { (size * Prefs.shared.textScale).rounded() }
+var panelWidth: CGFloat { (360 * Prefs.shared.textScale).rounded() }
 let heatWeeks = 13
 
 /// Small uppercase, letter-spaced section label.
 func cap(_ s: String) -> some View {
-    Text(s.uppercased()).font(.system(size: 9.5, weight: .semibold)).tracking(1.1).foregroundColor(.secondary)
+    Text(s.uppercased()).font(.system(size: fs(9.5), weight: .semibold)).tracking(1.1).foregroundColor(.secondary)
         .lineLimit(1)
 }
 
@@ -617,7 +624,7 @@ func bar(_ share: Double, _ color: Color = accent, height: CGFloat = 3) -> some 
 func tab(_ label: String, _ on: Bool, _ action: @escaping () -> Void) -> some View {
     Button(action: action) {
         VStack(spacing: 3) {
-            Text(label.uppercased()).font(.system(size: 10, weight: .semibold)).tracking(0.6)
+            Text(label.uppercased()).font(.system(size: fs(10), weight: .semibold)).tracking(0.6)
                 .foregroundColor(on ? accent : .secondary)
             Rectangle().fill(on ? accent : Color.clear).frame(height: 1.5)
         }
@@ -642,6 +649,7 @@ struct HeightKey: PreferenceKey {
 
 struct WidgetView: View {
     @ObservedObject var store: Store
+    @ObservedObject var prefs = Prefs.shared // re-render when the text size changes
     let menu: NSMenu
     var inPopover = false
 
@@ -670,7 +678,7 @@ struct WidgetView: View {
             ScrollView(.vertical, showsIndicators: false) {
                 content.background(GeometryReader { Color.clear.preference(key: HeightKey.self, value: $0.size.height) })
             }
-            .frame(width: 360, height: min(max(store.contentHeight, 120), maxH))
+            .frame(width: panelWidth, height: min(max(store.contentHeight, 120), maxH))
             .onPreferenceChange(HeightKey.self) { store.contentHeight = $0 }
         } else {
             content
@@ -698,16 +706,16 @@ struct WidgetView: View {
                 if !r.unpriced.isEmpty {
                     Label("No price for \(r.unpriced.sorted().joined(separator: ", ")) — add it in Settings › Pricing",
                           systemImage: "exclamationmark.triangle")
-                        .font(.caption2).foregroundColor(.orange)
+                        .font(.system(size: fs(10))).foregroundColor(.orange)
                 }
             } else {
-                Text("Scanning logs…").font(.caption).foregroundColor(.secondary)
+                Text("Scanning logs…").font(.system(size: fs(11))).foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 160)
             }
             footer
         }
         .padding(16)
-        .frame(width: 360)
+        .frame(width: panelWidth)
     }
 
     // MARK: header & filters
@@ -716,7 +724,7 @@ struct WidgetView: View {
         HStack(spacing: 7) {
             HStack(spacing: 5) {
                 Image(systemName: "chart.bar.fill").foregroundColor(accent)
-                Text("TOKENMETER").font(.system(size: 11, weight: .semibold).width(.expanded)).tracking(0.8)
+                Text("TOKENMETER").font(.system(size: fs(11), weight: .semibold).width(.expanded)).tracking(0.8)
                     .fixedSize()
             }
             .contentShape(Rectangle())
@@ -777,9 +785,9 @@ struct WidgetView: View {
                     HStack(spacing: 4) {
                         Image(systemName: "folder")
                         Text(p).lineLimit(1).truncationMode(.middle).frame(maxWidth: 70)
-                        Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
+                        Image(systemName: "xmark").font(.system(size: fs(8), weight: .bold))
                     }
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: fs(11), weight: .medium))
                     .padding(.horizontal, 8).padding(.vertical, 4)
                     .background(Capsule().fill(accent.opacity(0.16)))
                     .overlay(Capsule().strokeBorder(accent.opacity(0.7), lineWidth: 1))
@@ -798,7 +806,7 @@ struct WidgetView: View {
                 if value != nil { Circle().fill(color).frame(width: 6, height: 6) }
                 Text(label).fixedSize()
             }
-            .font(.system(size: 11, weight: .medium))
+            .font(.system(size: fs(11), weight: .medium))
             .padding(.horizontal, 9).padding(.vertical, 4)
             .background(Capsule().fill(on ? accent.opacity(0.16) : Color.primary.opacity(0.05)))
             .overlay(Capsule().strokeBorder(on ? accent.opacity(0.7) : Color.clear, lineWidth: 1))
@@ -834,15 +842,15 @@ struct WidgetView: View {
             ForEach(r.quotas) { q in
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
-                        Text(q.product).font(.system(size: 12, weight: .medium))
+                        Text(q.product).font(.system(size: fs(12), weight: .medium))
                         if let plan = q.plan {
-                            Text(plan.uppercased()).font(.system(size: 8.5, weight: .semibold)).tracking(0.6)
+                            Text(plan.uppercased()).font(.system(size: fs(8.5), weight: .semibold)).tracking(0.6)
                                 .padding(.horizontal, 5).padding(.vertical, 1.5)
                                 .background(Capsule().fill(Color.primary.opacity(0.09))).foregroundColor(.secondary)
                         }
                         Spacer()
                         if let at = q.asOf, Date().timeIntervalSince(at) > 3600 {
-                            Text("as of \(relative(at))").font(.system(size: 9.5)).foregroundColor(.secondary)
+                            Text("as of \(relative(at))").font(.system(size: fs(9.5))).foregroundColor(.secondary)
                         }
                     }
                     ForEach(q.meters) { m in
@@ -853,9 +861,9 @@ struct WidgetView: View {
                                 if let reset = m.resetsAt { Text("resets \(relative(reset))").foregroundColor(.secondary) }
                                 Text("\(Int(m.percent.rounded()))%").fontWeight(.semibold)
                                     .foregroundColor(m.percent >= 70 ? quotaColor(m.percent) : .primary)
-                                    .frame(minWidth: 34, alignment: .trailing)
+                                    .frame(minWidth: fs(34), alignment: .trailing)
                             }
-                            .font(.system(size: 10.5)).monospacedDigit()
+                            .font(.system(size: fs(10.5))).monospacedDigit()
                             bar(m.percent / 100, quotaColor(m.percent), height: 4)
                         }
                     }
@@ -879,25 +887,25 @@ struct WidgetView: View {
                 Spacer()
             }
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(usd(cur.cost)).font(.system(size: 38, weight: .light).width(.expanded)).monospacedDigit()
+                Text(usd(cur.cost)).font(.system(size: fs(38), weight: .light).width(.expanded)).monospacedDigit()
                     .lineLimit(1).minimumScaleFactor(0.6)
                 if prev.cost > 0.005 {
                     let pct = (cur.cost - prev.cost) / prev.cost * 100
                     let c: Color = pct >= 0 ? .orange : .green
                     Text(pct >= 200 ? String(format: "▲ %.0f×", cur.cost / prev.cost)
                                      : String(format: "%@ %.0f%%", pct >= 0 ? "▲" : "▼", abs(pct)))
-                        .font(.system(size: 10, weight: .semibold)).monospacedDigit().foregroundColor(c)
+                        .font(.system(size: fs(10), weight: .semibold)).monospacedDigit().foregroundColor(c)
                         .help("vs the previous \(g.days == 1 ? "day" : "\(g.days) days")")
                 }
             }
-            Text(insight(es, cur, g.days)).font(.system(size: 12)).foregroundColor(.primary.opacity(0.85))
+            Text(insight(es, cur, g.days)).font(.system(size: fs(12))).foregroundColor(.primary.opacity(0.85))
             Text("\(tok(cur.tokens)) tokens · \(Int(cur.calls)) calls · \(duration(activeSeconds(es))) active\(remote ? " on this Mac" : "")")
-                .font(.system(size: 10.5)).foregroundColor(.secondary).monospacedDigit()
+                .font(.system(size: fs(10.5))).foregroundColor(.secondary).monospacedDigit()
                 .help("Active time: 5-minute slots with at least one model call")
             trend(r, g)
             if remote && g.hourly {
                 Text("Other devices report daily totals; they appear in the first hour.")
-                    .font(.system(size: 9.5)).foregroundColor(.secondary)
+                    .font(.system(size: fs(9.5))).foregroundColor(.secondary)
             }
         }
         .card()
@@ -1012,17 +1020,17 @@ struct WidgetView: View {
                 Spacer()
                 Text(label(n - 1))
             }
-            .font(.system(size: 8.5)).foregroundColor(.secondary)
+            .font(.system(size: fs(8.5))).foregroundColor(.secondary)
         }
     }
 
     func mix(_ label: String, _ v: Double, _ total: Double) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             cap(label)
-            Text(tok(v)).font(.system(size: 14, weight: .regular).width(.expanded)).monospacedDigit()
+            Text(tok(v)).font(.system(size: fs(14), weight: .regular).width(.expanded)).monospacedDigit()
                 .lineLimit(1).minimumScaleFactor(0.7)
             Text(total > 0 ? String(format: "%.1f%%", v / total * 100) : "—")
-                .font(.system(size: 9.5)).foregroundColor(.secondary).monospacedDigit()
+                .font(.system(size: fs(9.5))).foregroundColor(.secondary).monospacedDigit()
             bar(total > 0 ? v / total : 0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1051,7 +1059,7 @@ struct WidgetView: View {
                     VStack(spacing: 3) {
                         Text(w == 0 || monthStart ? first.addingTimeInterval(monthStart ? 6 * 86400 : 0)
                                 .formatted(.dateTime.month(.abbreviated)).uppercased() : " ")
-                            .font(.system(size: 8, weight: .semibold)).foregroundColor(.secondary)
+                            .font(.system(size: fs(8), weight: .semibold)).foregroundColor(.secondary)
                             .fixedSize().frame(height: 10)
                         ForEach(0..<7, id: \.self) { d in
                             let day = cal.date(byAdding: .day, value: 7 * w + d, to: start)!
@@ -1087,10 +1095,10 @@ struct WidgetView: View {
                     HStack {
                         Text(m.formatted(.dateTime.month(.wide).year()))
                         Spacer()
-                        Text(tok(byMonth[m]!.tokens)).foregroundColor(.secondary).frame(width: 70, alignment: .trailing)
-                        Text(usd(byMonth[m]!.cost)).frame(width: 74, alignment: .trailing)
+                        Text(tok(byMonth[m]!.tokens)).foregroundColor(.secondary).frame(width: fs(70), alignment: .trailing)
+                        Text(usd(byMonth[m]!.cost)).frame(width: fs(74), alignment: .trailing)
                     }
-                    .font(.system(size: 11.5)).monospacedDigit().padding(.vertical, 4)
+                    .font(.system(size: fs(11.5))).monospacedDigit().padding(.vertical, 4)
                     Divider().opacity(0.4)
                 }
             }
@@ -1116,7 +1124,7 @@ struct WidgetView: View {
     func stat(_ label: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             cap(label)
-            Text(value).font(.system(size: 15, weight: .regular).width(.expanded)).monospacedDigit()
+            Text(value).font(.system(size: fs(15), weight: .regular).width(.expanded)).monospacedDigit()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -1137,7 +1145,7 @@ struct WidgetView: View {
                 Spacer()
             }
             if es.isEmpty {
-                Text("No usage in this period").font(.caption).foregroundColor(.secondary)
+                Text("No usage in this period").font(.system(size: fs(11))).foregroundColor(.secondary)
             } else if store.mode == "day" {
                 days(r, g)
             } else {
@@ -1157,23 +1165,23 @@ struct WidgetView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 6) {
                                 if byProject || byDevice {
-                                    Image(systemName: byDevice ? "desktopcomputer" : "folder").font(.system(size: 9)).foregroundColor(.secondary)
+                                    Image(systemName: byDevice ? "desktopcomputer" : "folder").font(.system(size: fs(9))).foregroundColor(.secondary)
                                 } else {
                                     Circle().fill(providerColor(byProvider ? grp.key : providerOf(grp.key)))
                                         .frame(width: 6, height: 6)
                                 }
-                                Text(grp.key).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                                Text(grp.key).font(.system(size: fs(12), weight: .medium)).lineLimit(1)
                                     .truncationMode(.middle).help(grp.key)
                                 Spacer()
-                                Text(tok(grp.row.tokens)).font(.system(size: 10.5)).foregroundColor(.secondary)
+                                Text(tok(grp.row.tokens)).font(.system(size: fs(10.5))).foregroundColor(.secondary)
                                 Text(cur.cost > 0 ? String(format: "%.0f%%", grp.row.cost / cur.cost * 100) : "—")
-                                    .font(.system(size: 10.5)).foregroundColor(.secondary).frame(minWidth: 30, alignment: .trailing)
+                                    .font(.system(size: fs(10.5))).foregroundColor(.secondary).frame(minWidth: fs(30), alignment: .trailing)
                                 Text(r.unpriced.contains(grp.key) ? "—" : usd(grp.row.cost))
-                                    .font(.system(size: 12, weight: .semibold)).frame(minWidth: 54, alignment: .trailing)
+                                    .font(.system(size: fs(12), weight: .semibold)).frame(minWidth: fs(54), alignment: .trailing)
                             }
                             .monospacedDigit()
                             bar(cur.cost > 0 ? grp.row.cost / cur.cost : 0)
-                            if byProvider || byDevice { Text(modelSplit(grp.es)).font(.system(size: 10)).foregroundColor(.secondary).lineLimit(2) }
+                            if byProvider || byDevice { Text(modelSplit(grp.es)).font(.system(size: fs(10))).foregroundColor(.secondary).lineLimit(2) }
                         }
                         .contentShape(Rectangle())
                     }
@@ -1182,7 +1190,7 @@ struct WidgetView: View {
                 if groups.count > 8 {
                     let rest = groups.dropFirst(8)
                     Text("+\(rest.count) more · \(usd(rest.reduce(0) { $0 + $1.row.cost }))")
-                        .font(.system(size: 10.5)).foregroundColor(.secondary)
+                        .font(.system(size: fs(10.5))).foregroundColor(.secondary)
                 }
             }
         }
@@ -1208,7 +1216,7 @@ struct WidgetView: View {
             .map { (day: $0, row: byDay[$0] ?? Row()) }
             .filter { g.days <= 90 || $0.row.tokens > 0 }
         return VStack(spacing: 0) {
-            HStack { cap("Date"); Spacer(); cap("Tokens").frame(width: 70, alignment: .trailing); cap("Cost").frame(width: 64, alignment: .trailing) }
+            HStack { cap("Date"); Spacer(); cap("Tokens").frame(width: fs(70), alignment: .trailing); cap("Cost").frame(width: fs(64), alignment: .trailing) }
                 .padding(.bottom, 6)
             ScrollView {
                 LazyVStack(spacing: 0) {
@@ -1219,10 +1227,10 @@ struct WidgetView: View {
                                      : x.day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day()))
                                 Spacer()
                                 Text(x.row.tokens > 0 ? tok(x.row.tokens) : "—").foregroundColor(.secondary)
-                                    .frame(width: 70, alignment: .trailing)
-                                Text(x.row.tokens > 0 ? usd(x.row.cost) : "—").frame(width: 64, alignment: .trailing)
+                                    .frame(width: fs(70), alignment: .trailing)
+                                Text(x.row.tokens > 0 ? usd(x.row.cost) : "—").frame(width: fs(64), alignment: .trailing)
                             }
-                            .font(.system(size: 11.5)).monospacedDigit()
+                            .font(.system(size: fs(11.5))).monospacedDigit()
                             .padding(.vertical, 5)
                             .foregroundColor(pickedDay == x.day ? accent : .primary)
                             .contentShape(Rectangle())
@@ -1255,7 +1263,7 @@ struct WidgetView: View {
                 }.help("More")
             }
         }
-        .font(.caption2).foregroundColor(.secondary)
+        .font(.system(size: fs(10))).foregroundColor(.secondary)
         .buttonStyle(.borderless)
     }
 }
@@ -1275,7 +1283,15 @@ struct SettingsView: View {
                     ForEach(alertThresholds, id: \.1) { Text($0.0).tag($0.1) }
                 }
                 Text("From this level the fullest plan limit appears next to the cost, in orange, and red from 90%.")
-                    .font(.caption).foregroundColor(.secondary)
+                    .font(.system(size: fs(11))).foregroundColor(.secondary)
+            }
+            Section("Text size") {
+                Picker("Panel text", selection: $prefs.textScale) {
+                    Text("Default").tag(CGFloat(1.0))
+                    Text("Large").tag(CGFloat(1.15))
+                    Text("Larger").tag(CGFloat(1.3))
+                }
+                .pickerStyle(.segmented)
             }
             Section("General") {
                 Toggle("Launch at login", isOn: $prefs.launchAtLogin)
@@ -1287,16 +1303,16 @@ struct SettingsView: View {
                 Text(VibeImporter.config() == nil
                      ? "Link the Vibe Usage app on this Mac first. TokenMeter then reads your account's history with the key it stored."
                      : "Read-only: downloads your account's usage from vibecafe.ai with the key the Vibe Usage app stored on this Mac, back to your first synced day. Nothing is uploaded. This Mac's numbers always come from its own logs.")
-                    .font(.caption).foregroundColor(.secondary)
+                    .font(.system(size: fs(11))).foregroundColor(.secondary)
             }
             Section("Pricing") {
                 Text("Costs are estimated at API list prices. Override or add models in ~/.config/tokenmeter/prices.json (USD per 1M tokens: input, output, cache read, cache write 5m, cache write 1h). The CLI reads the same file.")
-                    .font(.caption).foregroundColor(.secondary)
+                    .font(.system(size: fs(11))).foregroundColor(.secondary)
                 Button("Edit Prices…") { openPricesFile() }
             }
             Section("About") {
                 Text("TokenMeter \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev") reads the logs Claude Code and Codex write on this Mac. Nothing is uploaded; the only network request is the optional other-devices download.")
-                    .font(.caption).foregroundColor(.secondary)
+                    .font(.system(size: fs(11))).foregroundColor(.secondary)
             }
         }
         .formStyle(.grouped)
