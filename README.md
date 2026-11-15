@@ -40,7 +40,8 @@ provider / model / project / device / day) and **History** (13-week calendar, ev
 device pickers sit under the header and apply to every page. The menu bar shows
 today's cost; click it for the usage panel, right-click for the menu. It refreshes every 5 minutes and on wake.
 
-- Plan limits: Claude and Codex subscription windows (5h / 7d) as the tools last recorded them locally,
+- Plan limits: Claude and Codex subscription windows (5h / 7d) as the tools last recorded them locally, with how
+  much of each window has passed and the projected usage at reset ("on pace for 124% — may run out"),
   with reset times; the menu bar flags any limit above 80%.
 - Projects: breakdown by project (working directory) and a project filter.
 - Other devices (optional, off by default): if the Vibe Usage app is linked on this Mac, Settings → Other devices
@@ -50,7 +51,7 @@ today's cost; click it for the usage panel, right-click for the menu. It refresh
 - Ranges: period pills Today / 24H / 7D / 30D / 90D / All / Custom (From–To dates), or click any day. Today, 24H and single days chart by hour.
 - Trend strip under the headline number: hover a bar for its cost and tokens, click a day bar to focus it.
 - Active time: 5-minute slots with at least one model call.
-- Settings window (menu → Settings…): menu bar format (cost / tokens / both / fullest plan limit),
+- Settings window (menu → Settings…): menu bar format (cost / tokens / both / two lines / fullest plan limit),
   plan limit alert threshold, text size (Default / Large / Larger), launch at login, desktop widget, and Edit Prices….
 - Hero: cost for the range, change vs the previous period, a one-line takeaway
   ("$0.79 a day. Anthropic took 94% of it."), and the token mix (input / output / cached / cache writes).

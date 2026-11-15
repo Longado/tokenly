@@ -25,6 +25,12 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.16.0 — more lessons from Vibe Usage
+- **Plan-limit pace.** A thin second bar under each limit shows how much of the window has passed. A pace line projects usage at reset ("on pace for 124% — may run out", orange from 100%, red from 120%). Window lengths: Claude 5h / 7d; Codex `window_minutes`.
+- **Chart metric switch.** `$ / Tok / Time` on the trend strip; the activity calendar follows it. Time is active time, this Mac only. Hover shows cost, tokens and active time.
+- **Two-line menu bar.** New menu bar format "Cost over tokens (two lines)", drawn by SwiftUI inside the status item, with clicks passed through. The cost line turns orange or red at the plan-limit alert.
+- **Refresh spinner.** The footer shows a spinner while a scan runs.
+
 ### v0.15.0 — choose any period
 - **Period pills.** Today / 24H / 7D / 30D / 90D / All / Custom, as one row of pills, the way Vibe Usage presents its date filter. They replace the period dropdown.
 - **Custom.** Shows From / To date fields. Ranges of one day chart by hour, up to 120 days by day, and longer ranges by month. The comparison uses the previous period of the same length.

@@ -109,7 +109,15 @@ struct Entry {
 /// One subscription limit window, e.g. "7d" at 88%.
 struct QuotaMeter: Identifiable {
     let label: String, percent: Double, resetsAt: Date?
+    var window: TimeInterval? = nil // window length, for pace
     var id: String { label }
+    /// Share of the window that has passed (0...1), when known.
+    var elapsed: Double? {
+        guard let w = window, w > 0, let r = resetsAt else { return nil }
+        return min(1, max(0, 1 - r.timeIntervalSinceNow / w))
+    }
+    /// Usage at reset if the current pace continues.
+    var projected: Double? { elapsed.flatMap { $0 > 0.05 ? percent / $0 : nil } }
 }
 
 /// Subscription usage as last recorded locally by the tool itself.
@@ -313,7 +321,7 @@ final class Scanner {
             let reset = (w["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
             if let reset = reset, reset < Date() { return nil }
             return QuotaMeter(label: Scanner.windowLabel(minutes: num(w["window_minutes"])),
-                              percent: num(w["used_percent"]), resetsAt: reset)
+                              percent: num(w["used_percent"]), resetsAt: reset, window: num(w["window_minutes"]) * 60)
         }.sorted { ($0.resetsAt ?? .distantFuture) < ($1.resetsAt ?? .distantFuture) }
         if meters.isEmpty { return nil }
         return Quota(product: "Codex", plan: (rl["plan_type"] as? String)?.capitalized, meters: meters, asOf: at)
@@ -331,7 +339,8 @@ final class Scanner {
             guard let w = u[key] as? [String: Any], w["utilization"] is NSNumber else { return nil }
             let reset = parseDate(w["resets_at"])
             if let reset = reset, reset < Date() { return nil }
-            return QuotaMeter(label: label, percent: num(w["utilization"]), resetsAt: reset)
+            return QuotaMeter(label: label, percent: num(w["utilization"]), resetsAt: reset,
+                              window: key == "five_hour" ? 5 * 3600 : 7 * 86400)
         }
         if meters.isEmpty { return nil }
         let asOf = (cache["fetchedAtMs"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
@@ -543,7 +552,8 @@ final class Prefs: ObservableObject {
     }
 }
 
-let menuBarFormats = [("Today's cost", "cost"), ("Today's tokens", "tokens"), ("Cost + tokens", "both"), ("Fullest plan limit", "quota")]
+let menuBarFormats = [("Today's cost", "cost"), ("Today's tokens", "tokens"), ("Cost + tokens", "both"),
+                      ("Cost over tokens (two lines)", "stacked"), ("Fullest plan limit", "quota")]
 let alertThresholds = [("Off", 0), ("70%", 70), ("80%", 80), ("90%", 90)]
 
 // MARK: - Store
@@ -571,6 +581,7 @@ final class Store: ObservableObject {
     @Published var project: String? // nil = all projects
     @Published var device: String? // nil = all devices
     @Published var page = "overview" // overview | breakdown | history
+    @Published var metric = "cost" // charts: cost | tokens | time
     @Published var customFrom = daysAgo(13) // Custom range, inclusive local days
     @Published var customTo = today()
     @Published var mode = "provider" // breakdown: provider | model | project | day
@@ -580,10 +591,12 @@ final class Store: ObservableObject {
     private let scanner = Scanner()
     private let queue = DispatchQueue(label: "tokenmeter.scan", qos: .utility) // serializes scanner access
 
+    @Published var refreshing = false
     func refresh() {
+        refreshing = true
         queue.async {
             let r = self.scanner.run(otherDevices: Prefs.shared.includeOtherDevices)
-            DispatchQueue.main.async { self.report = r; self.onUpdate?(r) }
+            DispatchQueue.main.async { self.report = r; self.refreshing = false; self.onUpdate?(r) }
         }
     }
 
@@ -918,6 +931,21 @@ struct WidgetView: View {
                             }
                             .font(.system(size: fs(10.5))).monospacedDigit()
                             bar(m.percent / 100, quotaColor(m.percent), height: 4)
+                            if let e = m.elapsed, let proj = m.projected {
+                                bar(e, Color.primary.opacity(0.35), height: 2)
+                                HStack {
+                                    Text("\(Int((e * 100).rounded()))% of window passed")
+                                    Spacer()
+                                    if m.percent >= 100 {
+                                        Text("limit reached").foregroundColor(.red)
+                                    } else if proj > 100 {
+                                        Text("on pace for \(Int(proj.rounded()))% — may run out").foregroundColor(proj >= 120 ? .red : .orange)
+                                    } else {
+                                        Text("on pace for \(Int(proj.rounded()))%")
+                                    }
+                                }
+                                .font(.system(size: fs(9.5))).foregroundColor(.secondary)
+                            }
                         }
                     }
                 }
@@ -1022,32 +1050,39 @@ struct WidgetView: View {
             g.hourly ? g.from.addingTimeInterval(Double(i) * 3600) : cal.date(byAdding: g.unit, value: i, to: g.from)!
         }
         var slots = Array(repeating: Row(), count: n)
+        var active = Array(repeating: Set<Int>(), count: n)
         for e in scoped(r, g.from, g.to) {
             let i = g.hourly ? Int(e.hour.timeIntervalSince(g.from) / 3600)
                 : cal.dateComponents([g.unit], from: g.from, to: e.day).value(for: g.unit) ?? -1
-            if i >= 0 && i < n { slots[i].add(e.row) }
+            if i >= 0 && i < n { slots[i].add(e.row); active[i].formUnion(e.slots) }
         }
-        let maxV = slots.map { $0.cost }.max() ?? 0
+        let value: (Int) -> Double = { i in
+            store.metric == "tokens" ? slots[i].tokens : store.metric == "time" ? Double(active[i].count) * slotSeconds : slots[i].cost
+        }
+        let fmt: (Double) -> String = { v in store.metric == "tokens" ? tok(v) : store.metric == "time" ? duration(v) : usd(v) }
+        let maxV = (0..<n).map(value).max() ?? 0
         let hi = store.hover.flatMap { $0 < n ? $0 : nil }
         let label: (Int) -> String = { i in
             g.hourly ? hourLabel(start(i)) : g.unit == .month ? start(i).formatted(.dateTime.month(.abbreviated).year(.twoDigits)) : dayLabel(start(i))
         }
-        let peak = slots.indices.max { slots[$0].cost < slots[$1].cost }
+        let peak = (0..<n).max { value($0) < value($1) }
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
                 if let i = hi {
-                    cap("\(label(i)) · \(usd(slots[i].cost)) · \(tok(slots[i].tokens))")
+                    cap("\(label(i)) · \(usd(slots[i].cost)) · \(tok(slots[i].tokens))\(active[i].isEmpty ? "" : " · " + duration(Double(active[i].count) * slotSeconds))")
                 } else {
                     cap(g.hourly ? "By hour" : g.unit == .month ? "By month" : "By day")
-                    Spacer()
-                    if let p = peak, maxV > 0 { cap("Peak \(usd(maxV)) · \(label(p))") }
+                    if let p = peak, maxV > 0 { cap("· peak \(fmt(maxV)) · \(label(p))") }
                 }
                 Spacer()
+                tab("$", store.metric == "cost") { store.metric = "cost" }.help("Cost")
+                tab("Tok", store.metric == "tokens") { store.metric = "tokens" }.help("Tokens")
+                tab("Time", store.metric == "time") { store.metric = "time" }.help("Active time (this Mac)")
             }
             GeometryReader { geo in
                 HStack(alignment: .bottom, spacing: n > 40 ? 1 : 2) {
                     ForEach(0..<n, id: \.self) { i in
-                        let v = slots[i].cost
+                        let v = value(i)
                         RoundedRectangle(cornerRadius: 1.5)
                             .fill(v > 0 ? accent : Color.primary.opacity(0.15))
                             .frame(height: v > 0 && maxV > 0 ? max(2, geo.size.height * v / maxV) : 2)
@@ -1095,8 +1130,11 @@ struct WidgetView: View {
     func activity(_ r: Report) -> some View {
         let start = cal.date(byAdding: .day, value: -7 * (heatWeeks - 1),
                              to: cal.dateInterval(of: .weekOfYear, for: today())!.start)!
-        let daily = Dictionary(grouping: scoped(r, start, tomorrow()), by: { $0.day })
-            .mapValues { $0.reduce(0) { $0 + $1.row.cost } }
+        let daily = Dictionary(grouping: scoped(r, start, tomorrow()), by: { $0.day }).mapValues { es -> Double in
+            store.metric == "tokens" ? es.reduce(0) { $0 + $1.row.tokens }
+                : store.metric == "time" ? activeSeconds(es) : es.reduce(0) { $0 + $1.row.cost }
+        }
+        let fmt: (Double) -> String = { v in store.metric == "tokens" ? tok(v) : store.metric == "time" ? duration(v) : usd(v) }
         let maxV = daily.values.max() ?? 0
         let peak = daily.max { $0.value < $1.value }
         let g = store.span
@@ -1104,7 +1142,7 @@ struct WidgetView: View {
             HStack {
                 cap("Activity · \(heatWeeks) weeks")
                 Spacer()
-                if let p = peak { cap("Peak \(usd(p.value)) · \(dayLabel(p.key))") }
+                if let p = peak, p.value > 0 { cap("Peak \(fmt(p.value)) · \(dayLabel(p.key))") }
             }
             HStack(spacing: 0) {
                 ForEach(0..<heatWeeks, id: \.self) { w in
@@ -1123,7 +1161,7 @@ struct WidgetView: View {
                     .frame(maxWidth: .infinity)
                 }
             }
-            cap("Dot size = cost that day · click to focus")
+            cap("Dot size = \(store.metric == "tokens" ? "tokens" : store.metric == "time" ? "active time" : "cost") that day · click to focus")
         }
         .card()
     }
@@ -1171,7 +1209,7 @@ struct WidgetView: View {
         }
         .frame(width: 13, height: 13)
         .contentShape(Rectangle())
-        .help(day <= today() ? "\(dayLabel(day)) · \(usd(v))" : "")
+        .help(day <= today() ? "\(dayLabel(day)) · \(store.metric == "tokens" ? tok(v) : store.metric == "time" ? duration(v) : usd(v))" : "")
         .onTapGesture { if day <= today() { store.pickedDay = pickedDay == day ? nil : day } }
     }
 
@@ -1317,7 +1355,11 @@ struct WidgetView: View {
                 .help("Larger text (⌘+)").keyboardShortcut("=", modifiers: .command)
                 .disabled(prefs.textScale == Prefs.textScales.last)
             if inPopover {
-                Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }.help("Refresh")
+                if store.refreshing {
+                    ProgressView().controlSize(.mini).frame(width: fs(14))
+                } else {
+                    Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }.help("Refresh")
+                }
                 Button { menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) } label: {
                     Image(systemName: "ellipsis.circle")
                 }.help("More")
@@ -1403,6 +1445,11 @@ final class ClickThroughHostingView<V: View>: NSHostingView<V> {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
+/// Draws inside the status item while letting clicks reach the button underneath.
+final class PassthroughHostingView<V: View>: NSHostingView<V> {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 final class WidgetWindow: NSWindow {
     override var canBecomeKey: Bool { true }
 }
@@ -1417,6 +1464,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var hosting: NSView!
     let popover = NSPopover()
     var settingsWindow: NSWindow?
+    var stackedView: PassthroughHostingView<AnyView>?
     var sizeSub: AnyCancellable?
     let menu = NSMenu()
 
@@ -1508,11 +1556,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default: title = usd(t.cost)
         }
         var attrs: [NSAttributedString.Key: Any] = [:]
+        var alert: NSColor?
         if let q = q, let qText = qText, prefs.alertThreshold > 0, q.peak >= Double(prefs.alertThreshold) {
             if prefs.menuBarFormat != "quota" { title += " · \(qText)" }
-            attrs[.foregroundColor] = q.peak >= 90 ? NSColor.systemRed : NSColor.systemOrange
+            alert = q.peak >= 90 ? NSColor.systemRed : NSColor.systemOrange
+            attrs[.foregroundColor] = alert
         }
-        statusItem.button?.attributedTitle = NSAttributedString(string: title, attributes: attrs)
+        guard let button = statusItem.button else { return }
+        if prefs.menuBarFormat == "stacked" {
+            // Two small lines in one status item, drawn by SwiftUI (clicks pass through to the button).
+            let top = usd(t.cost) + (alert != nil ? " · \(Int((q?.peak ?? 0).rounded()))%" : "")
+            let view = AnyView(HStack(spacing: 3) {
+                Image(systemName: "chart.bar.fill").font(.system(size: 11))
+                VStack(alignment: .leading, spacing: -2) {
+                    Text(top).font(.system(size: 9.5, weight: .semibold).monospacedDigit())
+                        .foregroundColor(alert.map { Color(nsColor: $0) } ?? .primary)
+                    Text(tok(t.tokens)).font(.system(size: 8.5).monospacedDigit()).foregroundColor(.secondary)
+                }
+            }.fixedSize())
+            if stackedView == nil {
+                stackedView = PassthroughHostingView(rootView: view)
+                button.addSubview(stackedView!)
+            } else {
+                stackedView!.rootView = view
+            }
+            button.title = ""
+            button.image = nil
+            let size = stackedView!.fittingSize
+            statusItem.length = size.width + 8
+            stackedView!.frame = NSRect(x: 4, y: (button.bounds.height - size.height) / 2, width: size.width, height: size.height)
+            return
+        }
+        stackedView?.removeFromSuperview()
+        stackedView = nil
+        statusItem.length = NSStatusItem.variableLength
+        button.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "TokenMeter")
+        button.attributedTitle = NSAttributedString(string: title, attributes: attrs)
     }
 
     /// Debug: `TokenMeter --snapshot out.png [today|24h|week|month|90d|dayN] [--popover] [provider=…] [model=…]
