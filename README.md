@@ -45,6 +45,7 @@ today's cost; click it for the usage panel, right-click for the menu. It refresh
   Codex logs or Vibe Usage's saved reading), Claude from Claude Code's local cache. Subscription windows (5h / 7d) as the tools last recorded them locally, with what
   the full limit is worth at API prices (cost so far in the window ÷ % used), how much of each window has passed and the projected usage at reset ("on pace for 124% — may run out"),
   with reset times; the menu bar flags any limit above 80%.
+- Plan weeks (History): per 7-day window, cost, full limits used (cost ÷ that week's 100% value) and detected resets.
 - Projects: breakdown by project (working directory) and a project filter.
 - Other devices (optional, off by default): if the Vibe Usage app is linked on this Mac, Settings → Other devices
   downloads your account's usage from vibecafe.ai (read-only, with the key Vibe Usage stored) back to your first

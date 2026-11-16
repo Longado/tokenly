@@ -25,6 +25,18 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.26.0 — plan usage by week
+- **Reading history.**
+  - Every plan-limit reading Tokenly sees is kept in `~/Library/Application Support/Tokenly/plan-readings.json`: Codex logs (backfilled, one entry per change), live Codex reads, Vibe Usage's saved reading, and Claude's cache.
+  - Up to 50k readings, so weeks stay measurable after the tools' logs are gone.
+- **Reset detection.** On the main 7-day limit, a reset is a drop of more than 3 points within the same window, or a window that restarts before the previous one ended.
+- **Plan weeks** (History, Codex / Claude tabs). Eight weekly windows, anchored on the plan's reset time:
+  - cost;
+  - full limits used: cost ÷ what 100% was worth that week, from the stretch since the last reset; "≈" when the week has no readings and the latest known value is used;
+  - resets detected (↻N).
+- **Estimate after a reset.** The current-window estimate starts counting after the last detected reset.
+- `--tall` snapshot flag renders the unfolded panel without the screen-height cap.
+
 ### v0.25.0 — live Codex limit
 - **How it works.**
   - Same request the Codex app makes: `GET {base}/wham/usage`, with the ChatGPT login Codex keeps in `~/.codex/auth.json`.

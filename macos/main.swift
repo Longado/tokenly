@@ -138,6 +138,7 @@ struct Report {
     var updated = Date()
     var otherDevicesStatus = "" // why other devices are missing, when the import is on
     var liveStatus = "" // why the live Codex read failed, when it did
+    var readings: [QuotaReading] = []
 
     var devices: [String] { Array(Set(entries.map { $0.device })).sorted { $0 == thisMac ? true : $1 == thisMac ? false : $0 < $1 } }
     var firstDay: Date? { entries.map { $0.day }.min() }
@@ -185,6 +186,83 @@ let cal = Calendar.current
 func today() -> Date { cal.startOfDay(for: Date()) }
 func tomorrow() -> Date { cal.date(byAdding: .day, value: 1, to: today())! }
 func daysAgo(_ n: Int) -> Date { cal.date(byAdding: .day, value: -n, to: today())! }
+/// One plan-limit reading as a tool reported it: e.g. Codex 7d at 42% at 08:19, resetting Nov 19.
+struct QuotaReading: Codable, Hashable {
+    let product: String, label: String, percent: Double
+    let resetsAt: Date?, window: Double, at: Date
+}
+
+/// Times a limit was reset early (Codex reset credits, provider-wide resets): the % drops within the
+/// same window, or the window restarts before the previous one ended.
+func resetTimes(_ readings: [QuotaReading]) -> [Date] {
+    let rs = readings.sorted { $0.at < $1.at }
+    var out: [Date] = []
+    for (p, c) in zip(rs, rs.dropFirst()) {
+        guard let pr = p.resetsAt, let cr = c.resetsAt else { continue }
+        let sameWindow = abs(cr.timeIntervalSince(pr)) < 3600
+        if sameWindow && c.percent < p.percent - 3 { out.append(c.at) }
+        else if !sameWindow && cr > pr && pr > c.at { out.append(c.at) }
+    }
+    return out
+}
+
+/// One past or current 7-day window of a plan.
+struct PlanWeek: Identifiable {
+    let start: Date, end: Date, cost: Double, resets: Int, peak: Double?
+    let perFull: Double?   // what 100% was worth this week, when readings allow
+    var id: Date { start }
+}
+
+/// Weekly windows (anchored on the plan's latest reset time) with cost, resets and the week's own 100% value.
+func planWeeks(_ r: Report, _ product: String, weeks: Int = 8) -> [PlanWeek] {
+    let rs = r.readings.filter { $0.product == product && $0.label == "7d" }
+    guard let anchor = rs.max(by: { $0.at < $1.at })?.resetsAt else { return [] }
+    let resets = resetTimes(rs)
+    return (0..<weeks).compactMap { k -> PlanWeek? in
+        let end = anchor.addingTimeInterval(-Double(k) * 7 * 86400), start = end.addingTimeInterval(-7 * 86400)
+        let cost = productCost(r.entries, product, from: start, to: min(end, Date()))
+        guard cost > 0 else { return nil }
+        let inWeek = rs.filter { $0.at >= start && $0.at < end }
+        let weekResets = resets.filter { $0 >= start && $0 < end }
+        // 100% value: in the stretch since the last reset before a reading, cost ÷ % at that reading.
+        var perFull: Double?
+        if let best = inWeek.filter({ $0.percent >= 5 }).max(by: { $0.percent < $1.percent }) {
+            let segStart = max(start, weekResets.filter { $0 <= best.at }.max() ?? start)
+            let c = productCost(r.entries, product, from: segStart, to: best.at)
+            if c > 0 { perFull = c / best.percent * 100 }
+        }
+        return PlanWeek(start: start, end: end, cost: cost, resets: weekResets.count,
+                        peak: inWeek.map { $0.percent }.max(), perFull: perFull)
+    }
+}
+
+/// Keeps every plan reading Tokenly has seen, so weeks stay measurable after the tools' logs are gone.
+final class ReadingStore {
+    private(set) var all: [QuotaReading] = []
+    private var loaded = false
+    private let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Tokenly/plan-readings.json")
+
+    func merge(_ new: [QuotaReading]) -> [QuotaReading] {
+        if !loaded {
+            loaded = true
+            if let d = try? Data(contentsOf: url), let a = try? JSONDecoder().decode([QuotaReading].self, from: d) { all = a }
+        }
+        var seen = Set(all.map { "\($0.product)|\($0.label)|\(Int($0.at.timeIntervalSince1970))" })
+        var changed = false
+        for x in new where seen.insert("\(x.product)|\(x.label)|\(Int(x.at.timeIntervalSince1970))").inserted {
+            all.append(x); changed = true
+        }
+        if changed {
+            all.sort { $0.at < $1.at }
+            if all.count > 50_000 { all.removeFirst(all.count - 50_000) }
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let d = try? JSONEncoder().encode(all) { try? d.write(to: url) }
+        }
+        return all
+    }
+}
+
 /// API-price cost of one product's usage in [from, to), across every device (plan limits are per account).
 /// Other devices report whole days, so a day that only partly overlaps counts in proportion.
 func productCost(_ entries: [Entry], _ product: String, from: Date, to: Date = Date()) -> Double {
@@ -205,7 +283,10 @@ func estimateQuotas(_ r: Report) -> [Quota] {
     r.quotas.map { q in
         Quota(product: q.product, plan: q.plan, meters: q.meters.map { m in
             guard let w = m.window, let reset = m.resetsAt, let asOf = q.asOf, m.percent >= 5 else { return m }
-            let before = productCost(r.entries, q.product, from: reset.addingTimeInterval(-w), to: asOf)
+            let windowStart = reset.addingTimeInterval(-w)
+            let lastReset = resetTimes(r.readings.filter { $0.product == q.product && $0.label == m.label })
+                .filter { $0 >= windowStart && $0 <= asOf }.max()
+            let before = productCost(r.entries, q.product, from: max(windowStart, lastReset ?? windowStart), to: asOf)
             guard before > 0 else { return m }
             let perFull = before / m.percent * 100
             let after = Date().timeIntervalSince(asOf) > 900 ? productCost(r.entries, q.product, from: asOf) : 0
@@ -242,6 +323,7 @@ final class FileState {
     var unpriced = Set<String>()
     var model = "?", project = "" // Codex: set by turn_context lines, apply to later events
     var rateLimits: (at: Date, value: [String: Any])? // Codex: newest rate_limits seen in this file
+    var readings: [QuotaReading] = [] // Codex: every change of a limit's % seen in this file
 }
 
 /// Long-lived: keeps per-file results between refreshes and reads files in 1 MiB chunks,
@@ -253,6 +335,7 @@ final class Scanner {
     private let env = ProcessInfo.processInfo.environment
     private let vibe = VibeImporter()
     private let codexLive = CodexLive()
+    private let readingStore = ReadingStore()
     var liveCodex = true
     var liveStatus: String { liveCodex ? codexLive.status : "" }
 
@@ -370,6 +453,16 @@ final class Scanner {
                         add(st, date, "Codex", st.model, st.project, num(u["input_tokens"]) - c,
                             num(u["output_tokens"]), c, num(u["cache_write_input_tokens"]))
                     }
+                    if let rl = p["rate_limits"] as? [String: Any] {
+                        for k in ["primary", "secondary"] {
+                            guard let w = rl[k] as? [String: Any], let pct = w["used_percent"] as? NSNumber else { continue }
+                            let mins = num(w["window_minutes"]), label = Scanner.windowLabel(minutes: mins)
+                            let reset = (w["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+                            if let last = st.readings.last(where: { $0.label == label }), last.percent == pct.doubleValue, last.resetsAt == reset { continue }
+                            st.readings.append(QuotaReading(product: "Codex", label: label, percent: pct.doubleValue,
+                                                            resetsAt: reset, window: mins * 60, at: date))
+                        }
+                    }
                     if let rl = p["rate_limits"] as? [String: Any], date >= (st.rateLimits?.at ?? .distantPast) {
                         st.rateLimits = (date, rl)
                     }
@@ -469,6 +562,13 @@ final class Scanner {
             report.entries += remoteEntries()
             report.otherDevicesStatus = vibe.status
         }
+        var fresh = files.values.flatMap { $0.readings }
+        for q in report.quotas {
+            guard let at = q.asOf else { continue }
+            fresh += q.meters.map { QuotaReading(product: q.product, label: $0.label, percent: $0.percent,
+                                                 resetsAt: $0.resetsAt, window: $0.window ?? 0, at: at) }
+        }
+        report.readings = readingStore.merge(fresh)
         report.quotas = estimateQuotas(report)
         return report
     }
@@ -773,6 +873,7 @@ final class Store: ObservableObject {
     @Published var project: String? // nil = all projects
     @Published var device: String? // nil = all devices
     @Published var page = "overview" // overview | breakdown | history
+    @Published var planProduct = "Codex" // Plan weeks card
     @Published var metric = "cost" // charts: cost | tokens | time
     @Published var customFrom = daysAgo(13) // Custom range, inclusive local days
     @Published var customTo = today()
@@ -900,7 +1001,7 @@ struct WidgetView: View {
     /// In the popover, scroll once the content is taller than the screen allows.
     @ViewBuilder var body: some View {
         if inPopover {
-            let maxH = (NSScreen.main?.visibleFrame.height ?? 800) - 40
+            let maxH = CommandLine.arguments.contains("--tall") ? 5000 : (NSScreen.main?.visibleFrame.height ?? 800) - 40
             ScrollView(.vertical, showsIndicators: false) {
                 content.background(GeometryReader { Color.clear.preference(key: HeightKey.self, value: $0.size.height) })
             }
@@ -927,6 +1028,7 @@ struct WidgetView: View {
                     breakdown(r)
                     section("History")
                     activity(r)
+                    planHistory(r)
                     monthly(r)
                 }
                 foldButton
@@ -1461,6 +1563,50 @@ struct WidgetView: View {
             cap("Dot size = \(store.metric == "tokens" ? "tokens" : store.metric == "time" ? "active time" : "cost") that day · click to focus")
         }
         .card()
+    }
+
+    /// Plan usage by week: cost, full limits used (cost ÷ that week's 100% value) and detected resets.
+    func planHistory(_ r: Report) -> some View {
+        let products = r.quotas.map { $0.product }.filter { !planWeeks(r, $0, weeks: 1).isEmpty }
+        let product = products.contains(store.planProduct) ? store.planProduct : products.first ?? ""
+        let weeks = planWeeks(r, product)
+        let latestFull = weeks.compactMap { $0.perFull }.first
+        let firstReading = r.readings.filter { $0.product == product }.map { $0.at }.min()
+        return Group {
+            if !products.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        cap("Plan weeks")
+                        Spacer()
+                        ForEach(products, id: \.self) { p in tab(p, p == product) { store.planProduct = p } }
+                    }
+                    HStack {
+                        cap("Week"); Spacer()
+                        cap("Cost").frame(width: fs(64), alignment: .trailing)
+                        cap("Limits").frame(width: fs(52), alignment: .trailing)
+                        cap("Resets").frame(width: fs(48), alignment: .trailing)
+                    }
+                    ForEach(weeks) { w in
+                        let full = w.perFull ?? latestFull
+                        HStack {
+                            Text("\(dayLabel(w.start)) – \(dayLabel(w.end))\(w.end > Date() ? " ·" : "")")
+                            Spacer()
+                            Text(usd(w.cost)).frame(width: fs(64), alignment: .trailing)
+                            Text(full.map { "\(w.perFull == nil ? "≈" : "")\(String(format: "%.1f×", w.cost / $0))" } ?? "—")
+                                .frame(width: fs(52), alignment: .trailing)
+                                .foregroundColor(w.perFull == nil ? .secondary : .primary)
+                                .help(w.perFull.map { "100% was worth ≈ \(usd($0)) this week" } ?? "No readings this week; uses the latest known 100% value")
+                            Text(w.resets > 0 ? "↻\(w.resets)" : "—").frame(width: fs(48), alignment: .trailing)
+                                .foregroundColor(w.resets > 0 ? accent : .secondary)
+                        }
+                        .font(.system(size: fs(11.5))).monospacedDigit()
+                    }
+                    Text("Limits = week's cost ÷ what 100% was worth that week (≈ = latest known value). Resets are detected from readings\(firstReading.map { " since \(dayLabel($0))" } ?? "").")
+                        .font(.system(size: fs(9.5))).foregroundColor(.secondary)
+                }
+                .card()
+            }
+        }
     }
 
     /// History page: every month on record, newest first.
