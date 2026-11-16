@@ -893,6 +893,19 @@ final class Prefs: ObservableObject {
     /// Read-only import of the user's other devices from their Vibe Usage account.
     /// Read the Codex plan limit live from OpenAI with the Codex login on this Mac.
     @Published var liveCodex: Bool { didSet { ud.set(liveCodex, forKey: "liveCodex"); onDataChange?() } }
+    /// Monthly plan prices in USD; 0 = guess from the plan badge.
+    @Published var claudePlanPrice: Double { didSet { ud.set(claudePlanPrice, forKey: "claudePlanPrice") } }
+    @Published var codexPlanPrice: Double { didSet { ud.set(codexPlanPrice, forKey: "codexPlanPrice") } }
+    func planPrice(_ product: String, _ plan: String?) -> Double? {
+        let set = product == "Claude" ? claudePlanPrice : product == "Codex" ? codexPlanPrice : 0
+        if set > 0 { return set }
+        switch (product, plan?.lowercased() ?? "") {
+        case ("Claude", "max"), ("Codex", "pro"): return 200
+        case ("Claude", "pro"), ("Codex", "plus"): return 20
+        case ("Codex", "business"), ("Codex", "team"): return 30
+        default: return nil
+        }
+    }
     /// Ask Claude Code for the live Claude plan limit (no prompt, no tokens).
     @Published var liveClaude: Bool { didSet { ud.set(liveClaude, forKey: "liveClaude"); onDataChange?() } }
     @Published var includeOtherDevices: Bool { didSet { ud.set(includeOtherDevices, forKey: "includeOtherDevices"); onDataChange?() } }
@@ -942,6 +955,8 @@ final class Prefs: ObservableObject {
         includeOtherDevices = ud.bool(forKey: "includeOtherDevices")
         liveCodex = ud.object(forKey: "liveCodex") as? Bool ?? true
         liveClaude = ud.object(forKey: "liveClaude") as? Bool ?? true
+        claudePlanPrice = ud.double(forKey: "claudePlanPrice")
+        codexPlanPrice = ud.double(forKey: "codexPlanPrice")
         textScale = CGFloat(ud.object(forKey: "textScale") as? Double ?? 1.15)
         solidBackground = ud.object(forKey: "solidBackground") as? Bool ?? true
         showInsight = ud.object(forKey: "showInsight") as? Bool ?? true
@@ -1336,6 +1351,20 @@ struct WidgetView: View {
 
     // MARK: plan limits
 
+    /// "$200/mo plan · last 30 days worth $8,720 (44×)": what you pay vs what your use was worth at API prices.
+    @ViewBuilder func planValue(_ r: Report, _ q: Quota) -> some View {
+        if let price = prefs.planPrice(q.product, q.plan), price > 0 {
+            let worth = productCost(r.entries, q.product, from: daysAgo(29))
+            HStack(spacing: 4) {
+                Text("\(String(format: "$%.0f", price))/mo plan · last 30 days worth \(usd(worth))")
+                Spacer(minLength: 4)
+                Text(String(format: "%.1f×", worth / price)).fontWeight(.semibold).foregroundColor(worth >= price ? .green : .orange)
+            }
+            .font(.system(size: fs(10))).foregroundColor(.secondary).monospacedDigit().lineLimit(1)
+            .help("Your \(q.product) usage over the last 30 days (all devices) priced at API list prices, compared with what the plan costs. Set your price in Settings → Plan prices.")
+        }
+    }
+
     func quotaColor(_ pct: Double) -> Color { pct >= 90 ? .red : pct >= 70 ? .orange : accent }
 
     /// Subscription windows as the tools last recorded them locally (no network).
@@ -1360,6 +1389,7 @@ struct WidgetView: View {
                             Text("as of \(relative(at))").font(.system(size: fs(9.5))).foregroundColor(.secondary)
                         }
                     }
+                    planValue(r, q)
                     ForEach(q.meters) { m in
                         VStack(spacing: 4) {
                             HStack(spacing: 6) {
@@ -1979,6 +2009,12 @@ struct SettingsView: View {
                     .font(.system(size: fs(11))).foregroundColor(.secondary)
                 Toggle("Read Claude limits live", isOn: $prefs.liveClaude)
                 Text("Briefly runs Claude Code in a safe, tool-less mode to ask for your plan usage (at most every 5 minutes). No prompt is sent and no tokens are used. Off: Tokenly uses Claude Code's cached reading.")
+                    .font(.system(size: fs(11))).foregroundColor(.secondary)
+            }
+            Section("Plan prices") {
+                TextField("Claude, $ per month", value: $prefs.claudePlanPrice, format: .number)
+                TextField("Codex, $ per month", value: $prefs.codexPlanPrice, format: .number)
+                Text("0 = guess from the plan badge (Claude Max / Codex Pro $200, Claude Pro / ChatGPT Plus $20). Used for \"last 30 days worth N×\" under each plan.")
                     .font(.system(size: fs(11))).foregroundColor(.secondary)
             }
             Section("Other devices") {

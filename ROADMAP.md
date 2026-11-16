@@ -25,6 +25,13 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v1.0.0 — first stable release
+- **Plan prices.**
+  - Each plan shows what you pay next to what your last 30 days were worth at API prices: "$200/mo plan · last 30 days worth $8,452 · 42.3×".
+  - Prices are guessed from the plan badge (Claude Max / Codex Pro $200, Claude Pro / ChatGPT Plus $20, Business $30) and can be set in Settings → Plan prices.
+- **Docs and site.** README rewritten around the finished product (features, install, privacy table, CLI, pricing, data sources, development), and website screenshots refreshed.
+- Versions aligned: app 1.0.0 (build 31), CLI 1.0.0.
+
 ### v0.27.0 — live Claude limit
 - **How it works.**
   - Same request the Agent SDK makes: start `claude` with `--print --safe-mode --no-session-persistence --strict-mcp-config --tools "" --output-format/--input-format stream-json`, then send `initialize` and `get_usage` (`skip_behaviors: true`) over stdio.

@@ -12,7 +12,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-__version__ = "0.4.0"
+__version__ = "1.0.0"
 
 # USD per 1M tokens: input, output, cache_read, cache_write_5m, cache_write_1h.
 # Defaults; keep in sync with defaultPrices in macos/main.swift (tests/test_prices.py checks this).

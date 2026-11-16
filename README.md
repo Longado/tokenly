@@ -2,115 +2,107 @@
 
 # Tokenly
 
-Local token usage and API-equivalent cost for **Claude Code** and **Codex CLI**.
-One Python file, zero dependencies, no network, nothing uploaded.
+**What your AI coding really costs.** A tiny macOS menu bar app (plus a one-file CLI) for **Claude Code** and
+**Codex**: cost at API list prices, live plan limits, and where your tokens go, read from the logs on your Mac.
 
-统计本机 Claude Code / Codex CLI 的 token 用量，并按 API 标价折算等值费用。单文件、无依赖、纯本地。
+[Website](https://longado.github.io/tokenly/) · [Download for macOS](https://github.com/Longado/tokenly/releases/latest/download/Tokenly.zip) · [Roadmap](ROADMAP.md)
+
+<img src="docs/assets/overview.png" width="380" alt="Tokenly panel with cost, tokens, a provider-split chart and live plan limits">
+
+## Features
+
+**At a glance** (the panel opens folded)
+- Cost and tokens for the period, each with the change from the previous period, plus a one-line summary.
+- Trend bars by hour, day or month, split by provider; switch between cost, tokens and active time.
+- Live plan limits for Claude and Codex: plan badge, % used, time to reset, reset credits, a warning when you're
+  on pace to run out, what 100% of a limit is worth, and what your plan is worth vs its price ("44×").
+
+**Unfolded ("Show all")**
+- Breakdown by provider, model, project, device or day; click any row to filter the whole panel.
+- Token mix (input / output / cached / cache writes) with cache hit rate and savings.
+- Plan weeks: cost per 7-day window, full limits used, and resets detected.
+- 13-week activity calendar and every month on record.
+
+**Periods:** Today, 24H, 7D, 30D, 90D, All, or a custom From–To range.
+
+**Yours to tune:** menu bar format (cost, tokens, two lines, or fullest plan limit), plan-limit alert, which
+sections the overview shows, text size, solid or glass background, plan prices, model prices, launch at login, and
+an optional desktop widget.
 
 ## Install
 
-```bash
-pipx install git+https://github.com/Longado/tokenly
-# or just run it:
-python3 tokenly.py
-```
+1. Download [Tokenly.zip](https://github.com/Longado/tokenly/releases/latest/download/Tokenly.zip) and unzip it.
+2. Move `Tokenly.app` to Applications.
+3. Open it with right-click → Open the first time (the app is ad-hoc signed, not notarized).
+4. Click the menu bar icon. Settings → General → Launch at login, if you like.
 
-## Usage
+macOS 13 or later, Apple silicon or Intel.
 
-```bash
-tokenly                 # last 30 days, grouped by day / provider / model / project
-tokenly 7               # last 7 days
-tokenly --by provider   # one grouping: day | provider | model | project | all
-tokenly --quota         # plan limits (Claude, Codex) as last recorded locally
-tokenly --json          # machine-readable output (also with --quota)
-```
+## Privacy
 
-```
-By model (last 30d)
-                               input      output    cache_read   cache_write         total    cost($)
-claude:claude-opus-5-5         1,200     250,000    18,000,000     900,000    19,151,200      13.80
-codex:gpt-6.1-sol          2,000,000     120,000    30,000,000           0    32,120,000       8.20
-TOTAL                      2,001,200     370,000    48,000,000     900,000    51,271,200      22.00
-```
-*(sample numbers)*
+Tokenly reads the session logs Claude Code and Codex already write. It uploads nothing and needs no account.
+It makes only these requests, each of which can be turned off in Settings:
 
-## macOS app (menu bar)
-
-`Tokenly.app` is a native, dependency-free macOS menu bar app (13+). The panel opens folded on the
-overview (cost, trend, plan limits); "Show all" unfolds Breakdown (filters, token mix, by provider / model / project
-/ device / day) and History (13-week calendar, every month on record) on the same page. The menu bar shows
-today's cost; click it for the usage panel, right-click for the menu. It refreshes every 5 minutes and on wake.
-
-- Plan limits, live: Codex from OpenAI with the Codex login on this Mac; Claude by asking Claude Code itself
-  (`get_usage` over its control protocol: no prompt, no tokens). Both can be turned off in Settings → Plan limits;
-  then Codex logs / Vibe Usage's saved reading and Claude Code's cache are used. Subscription windows (5h / 7d) as the tools last recorded them locally, with what
-  the full limit is worth at API prices (cost so far in the window ÷ % used), how much of each window has passed and the projected usage at reset ("on pace for 124% — may run out"),
-  with reset times; the menu bar flags any limit above 80%.
-- Plan weeks (History): per 7-day window, cost, full limits used (cost ÷ that week's 100% value) and detected resets.
-- Projects: breakdown by project (working directory) and a project filter.
-- Other devices (optional, off by default): if the Vibe Usage app is linked on this Mac, Settings → Other devices
-  downloads your account's usage from vibecafe.ai (read-only, with the key Vibe Usage stored) back to your first
-  synced day. Adds a Devices switch (All / This Mac / one device), a Device breakdown and the All range with monthly
-  bars. This Mac's numbers still come from its own logs; other devices report daily totals.
-- Trend chart split by provider (Anthropic / OpenAI / Google / Other) with a legend; hover shows each share.
-- Ranges: period pills Today / 24H / 7D / 30D / 90D / All / Custom (From–To dates), or click any day. Today, 24H and single days chart by hour.
-- Trend strip under the headline number: hover a bar for its cost and tokens, click a day bar to focus it.
-- Active time: 5-minute slots with at least one model call.
-- Settings window (menu → Settings…): menu bar format (cost / tokens / both / two lines / fullest plan limit),
-  plan limit alert threshold, text size (Default / Large / Larger), launch at login, desktop widget, and Edit Prices….
-- Hero: cost for the range, change vs the previous period, a one-line takeaway
-  ("$0.79 a day. Anthropic took 94% of it."), and the token mix (input / output / cached / cache writes).
-- Filters: provider (All / Anthropic / OpenAI / Google, derived from the model name) and a model dropdown grouped by provider.
-- Activity: 13-week dot calendar (dot size = cost that day; click a dot to focus that day), plus 7-day / 30-day / daily-average totals.
-- Breakdown by provider (with per-model split), by model, or a daily table.
-- Optional desktop widget (menu → Show on Desktop); drag its header to move it.
-- Menu: Refresh, Show on Desktop, Launch at Login, Quit.
-
-Download `Tokenly.zip` from Releases, unzip, move to `/Applications`. The app is ad-hoc
-signed, so the first launch needs right-click → Open. Or build it yourself (Xcode command line tools only):
-
-```bash
-macos/build.sh            # -> macos/build/Tokenly.app
-cp -R macos/build/Tokenly.app /Applications/
-```
-
-`Tokenly --snapshot out.png [today|24h|week|month|90d|all|custom from=YYYY-MM-DD to=YYYY-MM-DD|dayN] [--popover|--settings] [hover=N] [device=name] [page=overview|all] [provider=OpenAI] [model=gpt-6.1-sol] [project=name] [mode=provider|model|project|day]` renders the panel to a PNG (for development).
-
-Prices are in `macos/main.swift` (`prices`) and `tokenly.py` (`PRICES`); keep them in sync.
-
-## Keeping history
-
-Claude Code deletes session logs after 30 days by default. To keep Tokenly's history, set
-`"cleanupPeriodDays": 3650` in `~/.claude/settings.json` on every Mac you use.
-
-## Data sources
-
-| Tool | Path | Notes |
+| What | How | Default |
 |---|---|---|
-| Claude Code | `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR`) | `message.usage`, deduped by message id + request id |
-| Codex CLI | `~/.codex/sessions/**/*.jsonl` (or `$CODEX_HOME`) | `token_count` events, `last_token_usage`; cached input split out |
+| Live Codex limit | `GET chatgpt.com/backend-api/wham/usage` with the Codex login in `~/.codex/auth.json`, at most every 2 min | on |
+| Live Claude limit | runs Claude Code in a safe, tool-less mode and asks `get_usage`: no prompt, no tokens, at most every 5 min | on |
+| Other devices | read-only download from your own Vibe Usage account, if that app is linked | off |
+
+Logins are read per request, sent only to their own service, and never stored or logged.
+
+## Command line
+
+```bash
+pipx install git+https://github.com/Longado/tokenly   # or: python3 tokenly.py
+tokenly                  # last 30 days by day / provider / model / project
+tokenly 7 --by provider  # one grouping: day | provider | model | project | all
+tokenly --quota          # plan limits as last recorded locally
+tokenly --json           # machine-readable (also with --quota)
+```
 
 ## Pricing
 
-Costs are **API list-price equivalents**, not what a subscription actually charges.
-Defaults live in `PRICES` (`tokenly.py`) and `defaultPrices` (`macos/main.swift`); a test keeps them identical.
-Override prices or add models in `~/.config/tokenly/prices.json`, read by both the app and the CLI
-(USD per 1M tokens: input, output, cache read, cache write 5m, cache write 1h):
+Costs are **API list-price equivalents**, not what a subscription charges. Defaults live in `tokenly.py` (`PRICES`)
+and `macos/main.swift` (`defaultPrices`); a test keeps them identical. Override or add models in
+`~/.config/tokenly/prices.json` (USD per 1M tokens: input, output, cache read, cache write 5m, cache write 1h),
+read by both the app and the CLI. Settings → Pricing → Edit Prices… opens it.
 
 ```json
 { "my-model": [1.0, 5.0, 0.1, 1.25, 2.0] }
 ```
 
-Model names are normalized first (router prefixes, `[1m]` context tags, date snapshots and, when that matches a
-priced model, effort suffixes are dropped), so variants of one model share a price and a row.
+Model names are normalized first (router prefixes, `[1m]` tags, date snapshots, and effort suffixes when that
+matches a priced model), so variants of one model share a price.
+
+## Keeping history
+
+Claude Code deletes session logs after 30 days by default. To keep your history, set
+`"cleanupPeriodDays": 3650` in `~/.claude/settings.json` on every Mac you use. Plan readings are kept by Tokenly
+itself in `~/Library/Application Support/Tokenly/`.
+
+## Data sources
+
+| Data | Source |
+|---|---|
+| Claude Code usage | `~/.claude/projects/**/*.jsonl` (`message.usage`, deduped by message id + request id) |
+| Codex usage | `~/.codex/sessions/**/*.jsonl` (`token_count` → `last_token_usage`, cached input split out) |
+| Claude plan limit | live `get_usage`, else `cachedUsageUtilization` in `~/.claude.json` |
+| Codex plan limit | live usage endpoint, else Vibe Usage's saved reading, else `rate_limits` in Codex logs |
+
+`$CLAUDE_CONFIG_DIR` and `$CODEX_HOME` are respected.
 
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests
+macos/build.sh                          # universal Tokenly.app + zip (Xcode command line tools only)
+python3 -m unittest discover -s tests   # CLI and price-table tests
+TOKENLY_DEMO=1 macos/build/Tokenly.app/Contents/MacOS/Tokenly --snapshot out.png week --popover
 ```
 
-See [ROADMAP.md](ROADMAP.md) for positioning and what comes next.
+`--snapshot out.png [today|24h|week|month|90d|all|custom from=… to=…|dayN] [--popover|--settings] [page=all]
+[--tall] [provider=…] [model=…] [project=…] [device=…] [mode=…] [hover=N]` renders the panel to a PNG;
+`TOKENLY_DEMO=1` uses made-up data.
 
 ## License
 
