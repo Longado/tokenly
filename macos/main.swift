@@ -173,11 +173,32 @@ struct Report {
                 }
             }
         }
+        let claudeReset = Date().addingTimeInterval(2.2 * 86400), codexReset = Date().addingTimeInterval(4.1 * 86400)
         let quotas = [
-            Quota(product: "Claude", plan: nil, meters: [QuotaMeter(label: "7d", percent: 64, resetsAt: Date().addingTimeInterval(2.2 * 86400), window: 7 * 86400)], asOf: Date()),
-            Quota(product: "Codex", plan: "Pro", meters: [QuotaMeter(label: "7d", percent: 38, resetsAt: Date().addingTimeInterval(4.1 * 86400), window: 7 * 86400)], asOf: Date()),
+            Quota(product: "Claude", plan: "Max", meters: [QuotaMeter(label: "7d", percent: 64, resetsAt: claudeReset, window: 7 * 86400)],
+                  asOf: Date(), source: "live"),
+            Quota(product: "Codex", plan: "Pro", meters: [QuotaMeter(label: "7d", percent: 38, resetsAt: codexReset, window: 7 * 86400)],
+                  asOf: Date(), source: "live", resetCredits: 2),
         ]
-        return Report(entries: entries, unpriced: [], quotas: quotas)
+        // Eight weeks of readings; Codex gets a mid-week reset in two of them.
+        var readings: [QuotaReading] = []
+        for (product, reset, resetWeeks) in [("Claude", claudeReset, Set<Int>()), ("Codex", codexReset, Set([2, 5]))] {
+            for k in 0..<8 {
+                let end = reset.addingTimeInterval(-Double(k) * 7 * 86400), start = end.addingTimeInterval(-7 * 86400)
+                var pct = 0.0
+                for step in 1...12 {
+                    let at = start.addingTimeInterval(Double(step) * 7 * 86400 / 13)
+                    if at > Date() { break }
+                    pct += Double.random(in: 5...11, using: &rng)
+                    if resetWeeks.contains(k) && step == 7 { pct = 4 }
+                    readings.append(QuotaReading(product: product, label: "7d", percent: min(pct, 99), resetsAt: end, window: 7 * 86400, at: at))
+                }
+            }
+        }
+        var r = Report(entries: entries, unpriced: [], quotas: quotas)
+        r.readings = readings
+        r.quotas = estimateQuotas(r)
+        return r
     }
 }
 
@@ -1109,7 +1130,10 @@ struct WidgetView: View {
     var content: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
-            if let r = store.report {
+            if let r = store.report, CommandLine.arguments.contains("only=history") {
+                planHistory(r)
+                activity(r)
+            } else if let r = store.report {
                 controls(r)
                 hero(r)
                 if prefs.showLimits && !r.quotas.isEmpty { quotas(r) }

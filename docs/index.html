@@ -108,7 +108,7 @@
     <p class="sub">The panel opens on a short overview. Unfold it when you want the breakdown and the history.</p>
     <div class="grid">
       <div class="card"><span class="ico">$</span><h3>Cost and tokens</h3><p>Spend at API list prices next to token volume, with the change from the previous period and a one-line summary.</p></div>
-      <div class="card"><span class="ico">%</span><h3>Plan limits and pace</h3><p>Claude and Codex 5h / 7d limits, time to reset, a warning when you're on pace to run out, and what 100% of a limit is worth.</p></div>
+      <div class="card"><span class="ico">%</span><h3>Live plan limits</h3><p>Claude and Codex limits read live, plan badge, reset credits, time to reset, a warning when you're on pace to run out, and what 100% of a limit is worth.</p></div>
       <div class="card"><span class="ico">▤</span><h3>Where it goes</h3><p>Split by provider, model, project and device. Charts stack by provider; the token mix shows what the cache saved you.</p></div>
       <div class="card"><span class="ico">⌚</span><h3>Any period</h3><p>Today, 24 hours, 7 / 30 / 90 days, all time or a custom range. Hourly, daily or monthly bars, and a 13-week calendar.</p></div>
       <div class="card"><span class="ico">⌂</span><h3>All your Macs</h3><p>Optionally bring in your other devices from a linked Vibe Usage account, read-only, back to your first day.</p></div>
@@ -123,12 +123,29 @@
         <div class="eyebrow">Unfolded</div>
         <h2>The full picture, on one page.</h2>
         <ul class="points">
+          <li><b>Plan weeks</b>Cost, full limits used and resets for every week.</li>
           <li><b>Breakdown</b>Provider, model, project, device or day. Click any row to filter the whole panel.</li>
           <li><b>Token mix</b>Input, output, cached and cache writes, with your cache hit rate and savings.</li>
           <li><b>History</b>A 13-week activity calendar and every month on record.</li>
           <li><b>Cost, tokens or time</b>Switch the charts between dollars, tokens and active time.</li>
         </ul>
       </div>
+    </div>
+  </section>
+
+  <section id="plans">
+    <div class="pair">
+      <div>
+        <div class="eyebrow">Plan weeks</div>
+        <h2>How many full limits did you really use?</h2>
+        <p class="sub">Tokenly keeps every plan reading it sees, so each week gets its own numbers, even after the tools' logs are gone.</p>
+        <ul class="points">
+          <li><b>Cost per week</b>What each 7-day window cost at API prices, across all your devices.</li>
+          <li><b>Full limits used</b>The week's cost divided by what 100% was worth that same week.</li>
+          <li><b>Resets detected</b>A mid-week drop in usage shows up as ↻, so weeks above 100% make sense.</li>
+        </ul>
+      </div>
+      <img src="assets/history.png" alt="Plan weeks table with cost, full limits used and detected resets, above the activity calendar">
     </div>
   </section>
 
