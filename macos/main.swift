@@ -335,9 +335,11 @@ final class Scanner {
     private let env = ProcessInfo.processInfo.environment
     private let vibe = VibeImporter()
     private let codexLive = CodexLive()
+    private let claudeLive = ClaudeLive()
+    var liveClaude = true
     private let readingStore = ReadingStore()
     var liveCodex = true
-    var liveStatus: String { liveCodex ? codexLive.status : "" }
+    var liveStatus: String { [liveCodex ? codexLive.status : "", liveClaude ? claudeLive.status : ""].first { !$0.isEmpty } ?? "" }
 
     /// Other devices' daily buckets as entries, priced with our table when we know the model.
     func remoteEntries() -> [Entry] {
@@ -518,8 +520,10 @@ final class Scanner {
                      source: "Codex logs on this Mac")
     }
 
-    /// Claude: the utilization Claude Code caches in ~/.claude.json. Windows that already reset are dropped.
+    /// Claude: live from Claude Code when enabled, else the utilization it caches in ~/.claude.json.
+    /// Windows that already reset are dropped.
     func claudeQuota() -> Quota? {
+        if liveClaude, let live = claudeLive.quota() { return live }
         let dir = env["CLAUDE_CONFIG_DIR"] ?? NSHomeDirectory()
         guard let data = FileManager.default.contents(atPath: dir + "/.claude.json"),
               let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -741,6 +745,91 @@ final class CodexLive {
     }
 }
 
+// MARK: - Live Claude limit
+
+/// Asks Claude Code itself for the live plan usage, the way the Agent SDK does: start the `claude` binary in a
+/// safe, tool-less, session-less mode and exchange `initialize` + `get_usage` over its stdio control protocol.
+/// No prompt is sent and no tokens are used; Claude Code reads its own login. At most once every 5 minutes.
+final class ClaudeLive {
+    private(set) var status = ""
+    private var last: Quota?
+    private var lastAttempt = Date.distantPast
+    private let minInterval: TimeInterval = 300
+
+    private func binary() -> String? {
+        let env = ProcessInfo.processInfo.environment, home = NSHomeDirectory()
+        var candidates = [home + "/.local/bin/claude", home + "/.claude/local/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+        candidates += (env["PATH"] ?? "").split(separator: ":").map { "\($0)/claude" }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    func quota() -> Quota? {
+        if Date().timeIntervalSince(lastAttempt) < minInterval { return last }
+        lastAttempt = Date()
+        guard let bin = binary() else { status = "Claude Code not found for the live read"; return last }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: bin)
+        p.arguments = ["--print", "--safe-mode", "--no-session-persistence", "--strict-mcp-config",
+                       "--mcp-config", #"{"mcpServers":{}}"#, "--tools", "", "--output-format", "stream-json",
+                       "--input-format", "stream-json", "--verbose",
+                       "--settings", #"{"env":{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":""}}"#]
+        var env = ProcessInfo.processInfo.environment
+        for k in ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
+                  "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_PID"] { env.removeValue(forKey: k) }
+        env["PATH"] = (env["PATH"].map { $0 + ":" } ?? "") + "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        p.environment = env
+        let input = Pipe(), output = Pipe()
+        p.standardInput = input; p.standardOutput = output; p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { status = "Couldn't start Claude Code"; return last }
+        let deadline = DispatchWorkItem { if p.isRunning { p.terminate() } } // ends a hung read via EOF
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: deadline)
+        defer { deadline.cancel(); if p.isRunning { p.terminate() } }
+        func send(_ id: String, _ request: [String: Any]) {
+            let msg: [String: Any] = ["type": "control_request", "request_id": id, "request": request]
+            if let d = try? JSONSerialization.data(withJSONObject: msg) { input.fileHandleForWriting.write(d + Data("\n".utf8)) }
+        }
+        send("tokenly-init", ["subtype": "initialize"])
+        var buffer = Data(), payload: [String: Any]?, answered = false
+        let out = output.fileHandleForReading
+        reading: while true {
+            let chunk = out.availableData
+            if chunk.isEmpty { break }
+            buffer.append(chunk)
+            while let nl = buffer.firstIndex(of: 0x0A) {
+                let line = buffer[buffer.startIndex..<nl]
+                buffer = Data(buffer[buffer.index(after: nl)...])
+                guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                      o["type"] as? String == "control_response", let r = o["response"] as? [String: Any] else { continue }
+                if r["request_id"] as? String == "tokenly-init" {
+                    send("tokenly-usage", ["subtype": "get_usage", "skip_behaviors": true])
+                } else if r["request_id"] as? String == "tokenly-usage" {
+                    answered = true
+                    if r["subtype"] as? String == "success" { payload = r["response"] as? [String: Any] }
+                    break reading
+                }
+            }
+        }
+        try? input.fileHandleForWriting.close()
+        guard let pl = payload else { status = answered ? "Claude Code couldn't read usage" : "Claude Code didn't answer in time"; return last }
+        if pl["rate_limits_available"] as? Bool == false { status = ""; last = nil; return nil } // API-key login: no plan limits
+        let limits = pl["rate_limits"] as? [String: Any] ?? [:]
+        let now = Date()
+        let week: TimeInterval = 7 * 86400
+        let windows: [(String, String, TimeInterval)] = [("five_hour", "5h", 5 * 3600), ("seven_day", "7d", week),
+                                                         ("seven_day_opus", "7d Opus", week), ("seven_day_sonnet", "7d Sonnet", week)]
+        let meters = windows.compactMap { key, label, window -> QuotaMeter? in
+            guard let w = limits[key] as? [String: Any], let u = w["utilization"] as? NSNumber else { return nil }
+            let reset = parseDate(w["resets_at"])
+            if let reset = reset, reset < now { return nil }
+            return QuotaMeter(label: label, percent: u.doubleValue, resetsAt: reset, window: window)
+        }
+        guard !meters.isEmpty else { status = "Claude Code returned no limits"; return last }
+        status = ""
+        last = Quota(product: "Claude", plan: (pl["subscription_type"] as? String)?.capitalized, meters: meters, asOf: now, source: "live")
+        return last
+    }
+}
+
 // MARK: - Formatting
 
 private let groupedInt: NumberFormatter = {
@@ -783,6 +872,8 @@ final class Prefs: ObservableObject {
     /// Read-only import of the user's other devices from their Vibe Usage account.
     /// Read the Codex plan limit live from OpenAI with the Codex login on this Mac.
     @Published var liveCodex: Bool { didSet { ud.set(liveCodex, forKey: "liveCodex"); onDataChange?() } }
+    /// Ask Claude Code for the live Claude plan limit (no prompt, no tokens).
+    @Published var liveClaude: Bool { didSet { ud.set(liveClaude, forKey: "liveClaude"); onDataChange?() } }
     @Published var includeOtherDevices: Bool { didSet { ud.set(includeOtherDevices, forKey: "includeOtherDevices"); onDataChange?() } }
     var onDataChange: (() -> Void)?
     static let textScales: [CGFloat] = [1.0, 1.15, 1.3]
@@ -829,6 +920,7 @@ final class Prefs: ObservableObject {
         showDesktopWidget = ud.bool(forKey: "showDesktopWidget")
         includeOtherDevices = ud.bool(forKey: "includeOtherDevices")
         liveCodex = ud.object(forKey: "liveCodex") as? Bool ?? true
+        liveClaude = ud.object(forKey: "liveClaude") as? Bool ?? true
         textScale = CGFloat(ud.object(forKey: "textScale") as? Double ?? 1.15)
         solidBackground = ud.object(forKey: "solidBackground") as? Bool ?? true
         showInsight = ud.object(forKey: "showInsight") as? Bool ?? true
@@ -889,6 +981,7 @@ final class Store: ObservableObject {
         refreshing = true
         queue.async {
             self.scanner.liveCodex = Prefs.shared.liveCodex
+            self.scanner.liveClaude = Prefs.shared.liveClaude
             var r = ProcessInfo.processInfo.environment["TOKENLY_DEMO"] != nil ? Report.demo()
                 : self.scanner.run(otherDevices: Prefs.shared.includeOtherDevices)
             r.liveStatus = self.scanner.liveStatus
@@ -1860,6 +1953,9 @@ struct SettingsView: View {
                 Toggle("Read Codex limits live", isOn: $prefs.liveCodex)
                 Text("Asks OpenAI for your current Codex usage with the Codex login on this Mac (at most every 2 minutes). The login is never stored or sent anywhere else. Off: Tokenly uses Codex's logs and Vibe Usage's saved reading.")
                     .font(.system(size: fs(11))).foregroundColor(.secondary)
+                Toggle("Read Claude limits live", isOn: $prefs.liveClaude)
+                Text("Briefly runs Claude Code in a safe, tool-less mode to ask for your plan usage (at most every 5 minutes). No prompt is sent and no tokens are used. Off: Tokenly uses Claude Code's cached reading.")
+                    .font(.system(size: fs(11))).foregroundColor(.secondary)
             }
             Section("Other devices") {
                 Toggle("Include my other devices from Vibe Usage", isOn: $prefs.includeOtherDevices)
@@ -2281,6 +2377,7 @@ func migrateFromTokenMeter() {
 }
 
 makeIconsetIfRequested()
+signal(SIGPIPE, SIG_IGN) // a probe that exits early must not take the app down with it
 migrateFromTokenMeter()
 let app = NSApplication.shared
 let delegate = AppDelegate()

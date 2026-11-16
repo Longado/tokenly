@@ -25,6 +25,16 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.27.0 — live Claude limit
+- **How it works.**
+  - Same request the Agent SDK makes: start `claude` with `--print --safe-mode --no-session-persistence --strict-mcp-config --tools "" --output-format/--input-format stream-json`, then send `initialize` and `get_usage` (`skip_behaviors: true`) over stdio.
+  - No prompt is sent and no tokens are used; Claude Code reads its own login.
+  - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is stripped and unset via `--settings`, otherwise `rate_limits` comes back null.
+- **Light on resources.** At most once every 5 minutes, with a 10 s hard deadline (the process is terminated). It answers in about 0.4 s on the dev Mac and leaves no stray processes.
+- **What it shows.** Plan badge (MAX), 5h / 7d / 7d Opus / 7d Sonnet windows; readings also feed the plan-weeks history.
+- **Fallback and setting.** An API-key login means no plan limits, so the card is hidden. On failure, Tokenly falls back to `~/.claude.json` and the footer says why. On by default: Settings → Plan limits → "Read Claude limits live".
+- Binary lookup order: `~/.local/bin`, `~/.claude/local`, Homebrew, then `PATH`.
+
 ### v0.26.0 — plan usage by week
 - **Reading history.**
   - Every plan-limit reading Tokenly sees is kept in `~/Library/Application Support/Tokenly/plan-readings.json`: Codex logs (backfilled, one entry per change), live Codex reads, Vibe Usage's saved reading, and Claude's cache.
