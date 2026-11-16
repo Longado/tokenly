@@ -125,6 +125,8 @@ struct QuotaMeter: Identifiable {
 /// Subscription usage as last recorded locally by the tool itself.
 struct Quota: Identifiable {
     let product: String, plan: String?, meters: [QuotaMeter], asOf: Date?
+    var source = "" // where the reading came from, shown in the card
+    var resetCredits: Int? = nil
     var id: String { product }
     var peak: Double { meters.map { $0.percent }.max() ?? 0 }
 }
@@ -211,7 +213,7 @@ func estimateQuotas(_ r: Report) -> [Quota] {
             if after > 0 { out.recorded = m.percent; out = QuotaMeter(label: m.label, percent: min(100, m.percent + after / perFull * 100),
                                                                       resetsAt: reset, window: w, recorded: m.percent, perFull: perFull) }
             return out
-        }, asOf: q.asOf)
+        }, asOf: q.asOf, source: q.source, resetCredits: q.resetCredits)
     }
 }
 
@@ -380,9 +382,32 @@ final class Scanner {
             ? "\(Int(minutes / 1440))d" : "\(Int((minutes / 60).rounded()))h"
     }
 
-    /// Codex: newest `rate_limits` from its session logs. Windows that already reset are dropped.
+    /// Codex live reading saved by the Vibe Usage app (~/.vibe-usage/codex-rate-limits.json): %, reset time,
+    /// plan and reset credits only, no credentials. Fresher than Codex's own logs whenever Codex hasn't
+    /// run on this Mac recently, because Vibe Usage asks OpenAI directly.
+    func vibeCodexQuota() -> Quota? {
+        guard let data = FileManager.default.contents(atPath: NSHomeDirectory() + "/.vibe-usage/codex-rate-limits.json"),
+              let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let at = parseDate(d["fetchedAt"]) else { return nil }
+        let notEnforced = d["fiveHourNotEnforced"] as? Bool ?? false
+        let meters = [("fiveHour", "5h"), ("sevenDay", "7d")].compactMap { key, label -> QuotaMeter? in
+            guard let w = d[key] as? [String: Any], w["utilization"] is NSNumber, !(key == "fiveHour" && notEnforced) else { return nil }
+            let reset = parseDate(w["resetsAt"])
+            if let reset = reset, reset < Date() { return nil }
+            return QuotaMeter(label: label, percent: num(w["utilization"]), resetsAt: reset,
+                              window: (w["windowDuration"] as? NSNumber)?.doubleValue ?? (label == "5h" ? 18000 : 604800))
+        }
+        if meters.isEmpty { return nil }
+        return Quota(product: "Codex", plan: d["planLabel"] as? String, meters: meters, asOf: at,
+                     source: "live via Vibe Usage", resetCredits: (d["resetCreditsCount"] as? NSNumber)?.intValue)
+    }
+
+    /// Codex: the newer of Vibe Usage's live reading and the newest `rate_limits` in Codex's session logs.
+    /// Windows that already reset are dropped.
     func codexQuota() -> Quota? {
-        guard let (at, rl) = files.values.compactMap({ $0.rateLimits }).max(by: { $0.at < $1.at }) else { return nil }
+        let vibeLive = vibeCodexQuota()
+        guard let (at, rl) = files.values.compactMap({ $0.rateLimits }).max(by: { $0.at < $1.at }) else { return vibeLive }
+        if let v = vibeLive, let vAt = v.asOf, vAt > at { return v }
         let meters = ["primary", "secondary"].compactMap { k -> QuotaMeter? in
             guard let w = rl[k] as? [String: Any] else { return nil }
             let reset = (w["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
@@ -391,7 +416,8 @@ final class Scanner {
                               percent: num(w["used_percent"]), resetsAt: reset, window: num(w["window_minutes"]) * 60)
         }.sorted { ($0.resetsAt ?? .distantFuture) < ($1.resetsAt ?? .distantFuture) }
         if meters.isEmpty { return nil }
-        return Quota(product: "Codex", plan: (rl["plan_type"] as? String)?.capitalized, meters: meters, asOf: at)
+        return Quota(product: "Codex", plan: (rl["plan_type"] as? String)?.capitalized, meters: meters, asOf: at,
+                     source: "Codex logs on this Mac")
     }
 
     /// Claude: the utilization Claude Code caches in ~/.claude.json. Windows that already reset are dropped.
@@ -411,7 +437,7 @@ final class Scanner {
         }
         if meters.isEmpty { return nil }
         let asOf = (cache["fetchedAtMs"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
-        return Quota(product: "Claude", plan: nil, meters: meters, asOf: asOf)
+        return Quota(product: "Claude", plan: nil, meters: meters, asOf: asOf, source: "Claude Code on this Mac")
     }
 
     func run(otherDevices: Bool = false) -> Report {
@@ -1028,6 +1054,10 @@ struct WidgetView: View {
                                 .background(Capsule().fill(Color.primary.opacity(0.09))).foregroundColor(.secondary)
                         }
                         Spacer()
+                        if let c = q.resetCredits, c > 0 {
+                            Text("↻ \(c) reset\(c == 1 ? "" : "s") left").font(.system(size: fs(9.5))).foregroundColor(.secondary)
+                                .help("Reset credits you can redeem in Codex")
+                        }
                         if prefs.showLimitDetails, let at = q.asOf, Date().timeIntervalSince(at) > 3600 {
                             Text("as of \(relative(at))").font(.system(size: fs(9.5))).foregroundColor(.secondary)
                         }
@@ -1049,10 +1079,10 @@ struct WidgetView: View {
                             if let perFull = m.perFull {
                                 HStack {
                                     if let rec = m.recorded, let at = q.asOf {
-                                        Text("\(Int(rec.rounded()))% recorded \(relative(at)) + usage since")
-                                            .help("\(q.product) last recorded \(Int(rec.rounded()))% on this Mac \(relative(at)); the rest is estimated from usage on all devices since then")
+                                        Text("\(Int(rec.rounded()))% \(relative(at)) + usage since")
+                                            .help("Last reading: \(Int(rec.rounded()))% \(relative(at)) (\(q.source)). The rest is estimated from usage on all devices since then, so it can be off by a few points.")
                                     } else {
-                                        Text("\(usd(perFull * m.percent / 100)) used this window")
+                                        Text("\(usd(perFull * m.percent / 100)) used · \(q.source)").lineLimit(1)
                                     }
                                     Spacer()
                                     Text("100% ≈ \(usd(perFull))").fontWeight(.semibold).foregroundColor(.primary)

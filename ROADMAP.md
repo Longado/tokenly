@@ -25,6 +25,20 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.24.0 — Codex limit matches the live number
+Tokenly showed Codex at ≈63% while Vibe Usage showed the live 55%. Root causes:
+1. **Stale source.** Codex writes `rate_limits` into its logs only when it runs on this Mac. The newest local reading was 53%, 11 hours old.
+2. **Estimate overshoot.** The bridge estimate adds other devices' usage since the reading. Those devices report daily totals, spread evenly over the day, so morning work before the reading counted as after it.
+3. **Variable cost per %.** Model mix (priority models, Fable) changes how fast dollars use up the limit.
+
+Fix:
+- Tokenly reads the live Codex reading the Vibe Usage app saves in `~/.vibe-usage/codex-rate-limits.json` (%, reset time, plan, reset credits; no credentials) and uses it whenever it's newer than the logs. The estimate now only bridges the short gap since that reading.
+- The card names its source ("live via Vibe Usage" / "Codex logs on this Mac") and shows reset credits left.
+
+Still open:
+- Vibe Usage refreshes that file only when its own panel opens. A fully live reading would need Tokenly to call Codex's usage endpoint with the login in `~/.codex/auth.json` (opt-in, same approach as Vibe Usage).
+- Track readings over time to detect resets and measure "100% ≈ $" per week.
+
 ### v0.23.0 — plan limits estimated for now
 - **The problem.** Codex and Claude Code record plan usage only when they run on this Mac. While you work on other devices, the recorded % falls behind: Tokenly showed 42% while Codex showed 52%.
 - **The fix.** Tokenly now estimates the current %: the last recorded % plus usage since then on all devices, at the window's cost per %. The estimate is marked "≈", with "N% recorded X ago + usage since". Real data: ≈53% vs 52% actual.
