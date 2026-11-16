@@ -25,6 +25,16 @@ It reads the logs the tools already write. No account, no upload, no runtime to 
 
 ## Shipped
 
+### v0.25.0 — live Codex limit
+- **How it works.**
+  - Same request the Codex app makes: `GET {base}/wham/usage`, with the ChatGPT login Codex keeps in `~/.codex/auth.json`.
+  - `base` follows `chatgpt_base_url` in `~/.codex/config.toml`.
+  - The token is read per request, sent only to OpenAI, never stored or logged.
+- **Light on resources.** One request at most every 2 minutes, 10 s timeout, no retries; between requests the last answer is reused. The app measured 86 MB of memory and 0% CPU when idle.
+- **What it shows.** Live %, plan, reset time and reset credits ("↻ 2 resets left"). The card labels the source "live".
+- **Fallback.** When the read fails (expired login, offline), Tokenly falls back to Vibe Usage's saved reading or Codex's logs, and the footer says why.
+- **Setting.** On by default: Settings → Plan limits → "Read Codex limits live". The README and website privacy text now mention this request.
+
 ### v0.24.0 — Codex limit matches the live number
 Tokenly showed Codex at ≈63% while Vibe Usage showed the live 55%. Root causes:
 1. **Stale source.** Codex writes `rate_limits` into its logs only when it runs on this Mac. The newest local reading was 53%, 11 hours old.

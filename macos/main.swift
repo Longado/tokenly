@@ -137,6 +137,7 @@ struct Report {
     var quotas: [Quota] = []
     var updated = Date()
     var otherDevicesStatus = "" // why other devices are missing, when the import is on
+    var liveStatus = "" // why the live Codex read failed, when it did
 
     var devices: [String] { Array(Set(entries.map { $0.device })).sorted { $0 == thisMac ? true : $1 == thisMac ? false : $0 < $1 } }
     var firstDay: Date? { entries.map { $0.day }.min() }
@@ -251,6 +252,9 @@ final class Scanner {
     private var prices: [String: [Double]] = [:]
     private let env = ProcessInfo.processInfo.environment
     private let vibe = VibeImporter()
+    private let codexLive = CodexLive()
+    var liveCodex = true
+    var liveStatus: String { liveCodex ? codexLive.status : "" }
 
     /// Other devices' daily buckets as entries, priced with our table when we know the model.
     func remoteEntries() -> [Entry] {
@@ -405,6 +409,7 @@ final class Scanner {
     /// Codex: the newer of Vibe Usage's live reading and the newest `rate_limits` in Codex's session logs.
     /// Windows that already reset are dropped.
     func codexQuota() -> Quota? {
+        if liveCodex, let live = codexLive.quota() { return live }
         let vibeLive = vibeCodexQuota()
         guard let (at, rl) = files.values.compactMap({ $0.rateLimits }).max(by: { $0.at < $1.at }) else { return vibeLive }
         if let v = vibeLive, let vAt = v.asOf, vAt > at { return v }
@@ -567,6 +572,75 @@ final class VibeImporter {
     }
 }
 
+// MARK: - Live Codex limit
+
+/// Reads the live Codex plan usage the way the Codex app does: `GET {base}/wham/usage` with the ChatGPT login
+/// Codex stores in ~/.codex/auth.json. The token is read per request, sent only to OpenAI, never stored or logged.
+/// At most one request every two minutes; between requests the last answer is reused.
+final class CodexLive {
+    private(set) var status = ""
+    private var last: Quota?
+    private var lastAttempt = Date.distantPast
+    private let minInterval: TimeInterval = 120
+
+    private var home: String { ProcessInfo.processInfo.environment["CODEX_HOME"] ?? NSHomeDirectory() + "/.codex" }
+
+    private func endpoint() -> URL {
+        var base = "https://chatgpt.com/backend-api"
+        if let cfg = try? String(contentsOfFile: home + "/config.toml", encoding: .utf8),
+           let m = cfg.range(of: #"(?m)^\s*chatgpt_base_url\s*=\s*"([^"]+)""#, options: .regularExpression) {
+            let line = String(cfg[m])
+            if let q1 = line.firstIndex(of: "\""), let q2 = line.lastIndex(of: "\""), q1 < q2 {
+                base = String(line[line.index(after: q1)..<q2]).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                if (base.contains("chatgpt.com") || base.contains("chat.openai.com")) && !base.contains("/backend-api") { base += "/backend-api" }
+            }
+        }
+        return URL(string: base + (base.contains("/backend-api") ? "/wham/usage" : "/api/codex/usage"))!
+    }
+
+    func quota() -> Quota? {
+        if Date().timeIntervalSince(lastAttempt) < minInterval { return last }
+        lastAttempt = Date()
+        guard let data = FileManager.default.contents(atPath: home + "/auth.json"),
+              let auth = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = auth["tokens"] as? [String: Any],
+              let token = tokens["access_token"] as? String, !token.isEmpty else {
+            status = "Not signed in to Codex with ChatGPT"; return last
+        }
+        var req = URLRequest(url: endpoint(), timeoutInterval: 10)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("Tokenly", forHTTPHeaderField: "User-Agent")
+        if let account = tokens["account_id"] as? String, !account.isEmpty { req.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id") }
+        let done = DispatchSemaphore(value: 0)
+        var body: Data?, code = 0
+        URLSession.shared.dataTask(with: req) { d, resp, _ in
+            body = d; code = (resp as? HTTPURLResponse)?.statusCode ?? 0; done.signal()
+        }.resume()
+        done.wait()
+        guard code == 200, let body = body, let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            status = code == 401 || code == 403 ? "Codex login expired — open Codex to sign in again" : "Live Codex read failed (\(code == 0 ? "offline" : "HTTP \(code)"))"
+            return last
+        }
+        let now = Date()
+        let rl = obj["rate_limit"] as? [String: Any] ?? [:]
+        let meters = ["primary_window", "secondary_window"].compactMap { slot -> QuotaMeter? in
+            guard let w = rl[slot] as? [String: Any], let used = w["used_percent"] as? NSNumber,
+                  let secs = w["limit_window_seconds"] as? NSNumber else { return nil }
+            var reset: Date?
+            if let at = w["reset_at"] as? NSNumber, at.doubleValue > 0 { reset = Date(timeIntervalSince1970: at.doubleValue) }
+            else if let after = w["reset_after_seconds"] as? NSNumber { reset = now.addingTimeInterval(after.doubleValue) }
+            return QuotaMeter(label: Scanner.windowLabel(minutes: secs.doubleValue / 60), percent: used.doubleValue,
+                              resetsAt: reset, window: secs.doubleValue)
+        }.sorted { $0.window ?? 0 < $1.window ?? 0 }
+        let credits = ((obj["rate_limit_reset_credits"] as? [String: Any])?["available_count"] as? NSNumber)?.intValue
+        status = ""
+        last = meters.isEmpty ? nil : Quota(product: "Codex", plan: (obj["plan_type"] as? String)?.capitalized, meters: meters,
+                                            asOf: now, source: "live", resetCredits: credits)
+        return last
+    }
+}
+
 // MARK: - Formatting
 
 private let groupedInt: NumberFormatter = {
@@ -607,6 +681,8 @@ final class Prefs: ObservableObject {
     @Published var alertThreshold: Int { didSet { ud.set(alertThreshold, forKey: "alertThreshold"); onChange?() } }
     @Published var showDesktopWidget: Bool { didSet { ud.set(showDesktopWidget, forKey: "showDesktopWidget"); onChange?() } }
     /// Read-only import of the user's other devices from their Vibe Usage account.
+    /// Read the Codex plan limit live from OpenAI with the Codex login on this Mac.
+    @Published var liveCodex: Bool { didSet { ud.set(liveCodex, forKey: "liveCodex"); onDataChange?() } }
     @Published var includeOtherDevices: Bool { didSet { ud.set(includeOtherDevices, forKey: "includeOtherDevices"); onDataChange?() } }
     var onDataChange: (() -> Void)?
     static let textScales: [CGFloat] = [1.0, 1.15, 1.3]
@@ -652,6 +728,7 @@ final class Prefs: ObservableObject {
         alertThreshold = ud.object(forKey: "alertThreshold") as? Int ?? 80
         showDesktopWidget = ud.bool(forKey: "showDesktopWidget")
         includeOtherDevices = ud.bool(forKey: "includeOtherDevices")
+        liveCodex = ud.object(forKey: "liveCodex") as? Bool ?? true
         textScale = CGFloat(ud.object(forKey: "textScale") as? Double ?? 1.15)
         solidBackground = ud.object(forKey: "solidBackground") as? Bool ?? true
         showInsight = ud.object(forKey: "showInsight") as? Bool ?? true
@@ -710,8 +787,10 @@ final class Store: ObservableObject {
     func refresh() {
         refreshing = true
         queue.async {
-            let r = ProcessInfo.processInfo.environment["TOKENLY_DEMO"] != nil ? Report.demo()
+            self.scanner.liveCodex = Prefs.shared.liveCodex
+            var r = ProcessInfo.processInfo.environment["TOKENLY_DEMO"] != nil ? Report.demo()
                 : self.scanner.run(otherDevices: Prefs.shared.includeOtherDevices)
+            r.liveStatus = self.scanner.liveStatus
             DispatchQueue.main.async { self.report = r; self.refreshing = false; self.onUpdate?(r) }
         }
     }
@@ -1559,7 +1638,9 @@ struct WidgetView: View {
     var footer: some View {
         HStack(spacing: 6) {
             if let r = store.report {
-                if !r.otherDevicesStatus.isEmpty {
+                if !r.liveStatus.isEmpty {
+                    Label(r.liveStatus, systemImage: "exclamationmark.triangle").foregroundColor(.orange).lineLimit(1).help(r.liveStatus)
+                } else if !r.otherDevicesStatus.isEmpty {
                     Label(r.otherDevicesStatus, systemImage: "exclamationmark.triangle").foregroundColor(.orange).lineLimit(1)
                         .help(r.otherDevicesStatus)
                 } else {
@@ -1628,6 +1709,11 @@ struct SettingsView: View {
             Section("General") {
                 Toggle("Launch at login", isOn: $prefs.launchAtLogin)
                 Toggle("Show widget on desktop", isOn: $prefs.showDesktopWidget)
+            }
+            Section("Plan limits") {
+                Toggle("Read Codex limits live", isOn: $prefs.liveCodex)
+                Text("Asks OpenAI for your current Codex usage with the Codex login on this Mac (at most every 2 minutes). The login is never stored or sent anywhere else. Off: Tokenly uses Codex's logs and Vibe Usage's saved reading.")
+                    .font(.system(size: fs(11))).foregroundColor(.secondary)
             }
             Section("Other devices") {
                 Toggle("Include my other devices from Vibe Usage", isOn: $prefs.includeOtherDevices)

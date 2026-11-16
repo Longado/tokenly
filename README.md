@@ -41,7 +41,8 @@ overview (cost, trend, plan limits); "Show all" unfolds Breakdown (filters, toke
 / device / day) and History (13-week calendar, every month on record) on the same page. The menu bar shows
 today's cost; click it for the usage panel, right-click for the menu. It refreshes every 5 minutes and on wake.
 
-- Plan limits: Claude and Codex subscription windows (5h / 7d) as the tools last recorded them locally, with what
+- Plan limits: Codex read live from OpenAI with the Codex login on this Mac (Settings → Plan limits; otherwise
+  Codex logs or Vibe Usage's saved reading), Claude from Claude Code's local cache. Subscription windows (5h / 7d) as the tools last recorded them locally, with what
   the full limit is worth at API prices (cost so far in the window ÷ % used), how much of each window has passed and the projected usage at reset ("on pace for 124% — may run out"),
   with reset times; the menu bar flags any limit above 80%.
 - Projects: breakdown by project (working directory) and a project filter.
