@@ -189,6 +189,20 @@ def quotas():
                 reset = _iso(w.get("resets_at"))
                 if reset is None or _future(reset):
                     meters.append((label, float(w["utilization"]), reset))
+        # Per-model weekly caps (e.g. Fable), as `limits` entries of kind weekly_scoped or `model_scoped`.
+        scoped = []
+        for lim in util.get("limits") or []:
+            name = ((lim.get("scope") or {}).get("model") or {}).get("display_name") if isinstance(lim, dict) else None
+            if name and lim.get("kind") == "weekly_scoped":
+                scoped.append((name, lim.get("percent"), lim.get("resets_at")))
+        scoped += [(m.get("display_name"), m.get("utilization"), m.get("resets_at"))
+                   for m in util.get("model_scoped") or [] if isinstance(m, dict)]
+        for name, pct, resets in scoped:
+            if not name or not isinstance(pct, (int, float)):
+                continue
+            label, reset = f"7d {name}", _iso(resets)
+            if all(m[0] != label for m in meters) and (reset is None or _future(reset)):
+                meters.append((label, float(pct), reset))
         if meters:
             out.append(("Claude", None, meters))
     except (OSError, ValueError, AttributeError):

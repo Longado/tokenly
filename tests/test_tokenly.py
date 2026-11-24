@@ -75,6 +75,19 @@ class TokenmeterTest(unittest.TestCase):
         self.assertEqual(qs["Codex"][0], "Pro")
         self.assertEqual([(l, v) for l, v, _ in qs["Codex"][1]], [("7d", 42.0)])
 
+    def test_quota_model_caps(self):
+        later = "2100-01-01T00:00:00+00:00"
+        with open(os.path.join(self.tmp.name, "claude", ".claude.json"), "w") as f:
+            json.dump({"cachedUsageUtilization": {"utilization": {
+                "seven_day": {"utilization": 22, "resets_at": later},
+                "limits": [{"kind": "weekly_all", "percent": 22, "resets_at": later, "scope": None},
+                           {"kind": "weekly_scoped", "percent": 13, "resets_at": later,
+                            "scope": {"model": {"id": None, "display_name": "Fable"}}}],
+                "model_scoped": [{"display_name": "Fable", "utilization": 13, "resets_at": later},
+                                 {"display_name": "Old", "utilization": 9, "resets_at": "2000-01-01T00:00:00+00:00"}]}}}, f)
+        qs = {p: ms for p, _, ms in tokenly.quotas()}
+        self.assertEqual([(l, v) for l, v, _ in qs["Claude"]], [("7d", 22.0), ("7d Fable", 13.0)])
+
     def test_projects(self):
         p = tokenly.collect(30).groups["project"]
         self.assertEqual(sorted(p), ["proj-a", "proj-b"])

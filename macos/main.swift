@@ -132,6 +132,9 @@ struct QuotaMeter: Identifiable {
     var window: TimeInterval? = nil // window length, for pace
     var recorded: Double? = nil // the tool's last recorded %, when `percent` is an estimate for now
     var perFull: Double? = nil // API-price cost of 100% of this limit
+    var model: String? = nil // a per-model cap (e.g. "fable"): only that model's usage counts toward it
+    var ofWeekly: Double? = nil // per-model cap: points of the all-models 7d limit this model has used
+    var spent: Double? = nil // API-price cost so far in this window, when it isn't perFull × percent
     var id: String { label }
     /// Share of the window that has passed (0...1), when known.
     var elapsed: Double? {
@@ -347,10 +350,10 @@ final class ReadingStore {
 
 /// API-price cost of one product's usage in [from, to), across every device (plan limits are per account).
 /// Other devices report whole days, so a day that only partly overlaps counts in proportion.
-func productCost(_ entries: [Entry], _ product: String, from: Date, to: Date = Date()) -> Double {
+func productCost(_ entries: [Entry], _ product: String, from: Date, to: Date = Date(), model: String? = nil) -> Double {
     let key = product.lowercased(), now = Date()
     return entries.reduce(0) { acc, e in
-        guard e.tool.lowercased().contains(key) else { return acc }
+        guard e.tool.lowercased().contains(key), model.map({ e.model.lowercased().contains($0) }) ?? true else { return acc }
         if e.device == thisMac { return acc + (e.clippedHour(from: from, to: to)?.row.cost ?? 0) }
         let dayEnd = min(cal.date(byAdding: .day, value: 1, to: e.day)!, now)
         let length = dayEnd.timeIntervalSince(e.day)
@@ -361,6 +364,55 @@ func productCost(_ entries: [Entry], _ product: String, from: Date, to: Date = D
 
 /// The tools record plan usage only when they run on this Mac, so a reading goes stale while you work
 /// elsewhere. Estimate it for now: last recorded % plus usage since, at the window's cost-per-% rate.
+private func with(_ m: QuotaMeter, percent: Double) -> QuotaMeter {
+    var out = QuotaMeter(label: m.label, percent: min(100, percent), resetsAt: m.resetsAt, window: m.window,
+                         recorded: m.recorded, perFull: m.perFull, model: m.model, ofWeekly: m.ofWeekly)
+    out.spent = m.spent.map { $0 * percent / m.percent }
+    return out
+}
+
+/// Claude's plan limits, from a live get_usage reply's `rate_limits` or the copy in ~/.claude.json. Besides the
+/// classic windows, plans can cap a model on its own (`limits` entries of kind weekly_scoped, or `model_scoped`),
+/// and `weekly_scoped_shares` says how many points of the all-models week that model used.
+func claudeMeters(_ u: [String: Any], now: Date = Date()) -> [QuotaMeter] {
+    let week: TimeInterval = 7 * 86400
+    func live(_ reset: Date?) -> Bool { reset.map { $0 >= now } ?? true }
+    var meters = [("five_hour", "5h", 5 * 3600.0), ("seven_day", "7d", week), ("seven_day_opus", "7d Opus", week),
+                  ("seven_day_sonnet", "7d Sonnet", week)].compactMap { key, label, window -> QuotaMeter? in
+        guard let w = u[key] as? [String: Any], let p = w["utilization"] as? NSNumber else { return nil }
+        let reset = parseDate(w["resets_at"])
+        return live(reset) ? QuotaMeter(label: label, percent: p.doubleValue, resetsAt: reset, window: window) : nil
+    }
+    let limits = u["limits"] as? [[String: Any]] ?? []
+    func modelName(_ l: [String: Any]) -> String? {
+        ((l["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String
+    }
+    let shareList = u["weekly_scoped_shares"] as? [[String: Any]] ?? []
+    var shares: [String: Double] = [:]
+    for s in shareList {
+        guard let i = (s["limit_index"] as? NSNumber)?.intValue, limits.indices.contains(i),
+              let name = modelName(limits[i]), let used = s["used_percent_of_weekly"] as? NSNumber else { continue }
+        shares[name] = used.doubleValue
+    }
+    var scoped: [(String, Double, Date?)] = limits.compactMap { l in
+        guard l["kind"] as? String == "weekly_scoped", let name = modelName(l), let p = l["percent"] as? NSNumber else { return nil }
+        return (name, p.doubleValue, parseDate(l["resets_at"]))
+    }
+    for s in u["model_scoped"] as? [[String: Any]] ?? [] {
+        guard let name = s["display_name"] as? String, let p = s["utilization"] as? NSNumber,
+              !scoped.contains(where: { $0.0 == name }) else { continue }
+        scoped.append((name, p.doubleValue, parseDate(s["resets_at"])))
+    }
+    // Some replies leave out `limits`; with one share and one per-model cap there is only one way to pair them.
+    if shares.isEmpty, shareList.count == 1, scoped.count == 1,
+       let used = shareList[0]["used_percent_of_weekly"] as? NSNumber { shares[scoped[0].0] = used.doubleValue }
+    for (name, percent, reset) in scoped where !name.isEmpty && live(reset) && !meters.contains(where: { $0.label == "7d \(name)" }) {
+        meters.append(QuotaMeter(label: "7d \(name)", percent: percent, resetsAt: reset, window: week,
+                                 model: name.lowercased(), ofWeekly: shares[name]))
+    }
+    return meters
+}
+
 func estimateQuotas(_ r: Report) -> [Quota] {
     r.quotas.map { q in
         Quota(product: q.product, plan: q.plan, meters: q.meters.map { m in
@@ -374,15 +426,57 @@ func estimateQuotas(_ r: Report) -> [Quota] {
                     + remote.reduce(0) { $0 + $1.row.cost }
             } ?? productCost(r.entries, q.product, from: start, to: asOf)
             guard before > 0 else { return m }
-            let perFull = before / m.percent * 100
-            let after = Date().timeIntervalSince(asOf) > 900 ? productCost(r.entries, q.product, from: asOf) : 0
+            let stale = Date().timeIntervalSince(asOf) > 900
             var out = m
-            out.perFull = perFull
-            if after > 0 { out = QuotaMeter(label: m.label, percent: min(100, m.percent + after / perFull * 100),
-                                           resetsAt: m.resetsAt, window: m.window, recorded: m.percent, perFull: perFull) }
+            if let model = m.model {
+                // A per-model cap counts only that model's usage.
+                let spent = productCost(r.entries, q.product, from: start, to: asOf, model: model)
+                guard spent > 0 else { return m }
+                out.perFull = spent / m.percent * 100
+                let after = stale ? productCost(r.entries, q.product, from: asOf, model: model) : 0
+                if after > 0 { out.recorded = m.percent; out = with(out, percent: m.percent + after / out.perFull! * 100) }
+                return out
+            }
+            // The all-models week: Claude says how many of its points each capped model used, so each model's
+            // usage is priced at its own rate instead of one blended $ per %, which moves whenever the mix does.
+            var rates: [(model: String?, perPoint: Double)] = []
+            var restCost = before, restPoints = m.percent
+            if m.label == "7d" {
+                for s in q.meters where s.model != nil && (s.ofWeekly ?? 0) >= 1 {
+                    let c = productCost(r.entries, q.product, from: start, to: asOf, model: s.model)
+                    guard c > 0 else { continue }
+                    rates.append((s.model, c / s.ofWeekly!)); restCost -= c; restPoints -= s.ofWeekly!
+                }
+            }
+            if !rates.isEmpty && (restPoints < 1 || restCost <= 0) { rates = [] }
+            let restRate = rates.isEmpty ? before / m.percent : restCost / restPoints
+            out.perFull = restRate * 100
+            if !rates.isEmpty { out.spent = before }
+            if stale {
+                var points = 0.0, scopedAfter = 0.0
+                for (model, perPoint) in rates {
+                    let c = productCost(r.entries, q.product, from: asOf, model: model)
+                    points += c / perPoint; scopedAfter += c
+                }
+                points += (productCost(r.entries, q.product, from: asOf) - scopedAfter) / restRate
+                if points > 0 { out.recorded = m.percent; out = with(out, percent: m.percent + points) }
+            }
             return out
         }, asOf: q.asOf, source: q.source, resetCredits: q.resetCredits)
     }
+}
+
+/// Tooltip for "100% ≈ $": which usage the value is measured on.
+func limitWorthHelp(_ m: QuotaMeter, _ q: Quota) -> String {
+    if let model = m.model {
+        let share = m.ofWeekly.map { " It has used \(Int($0.rounded())) points of the all-models week." } ?? ""
+        return "What this \(m.label) cap is worth at API list prices, from \(model.capitalized) usage in this window.\(share)"
+    }
+    let capped = q.meters.filter { $0.model != nil && $0.ofWeekly != nil }.map { $0.label.replacingOccurrences(of: "7d ", with: "") }
+    if m.label == "7d", m.spent != nil, !capped.isEmpty {
+        return "What the full week is worth at API list prices if spent on models other than \(capped.joined(separator: ", ")). Claude reports how many points those used, so each model is counted at its own rate."
+    }
+    return "What this plan's full \(m.label) limit is worth at API list prices, from usage in this window up to the last recorded %"
 }
 
 func activeSeconds(_ es: [Entry]) -> Double {
@@ -625,14 +719,7 @@ final class Scanner {
               let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let cache = d["cachedUsageUtilization"] as? [String: Any],
               let u = cache["utilization"] as? [String: Any] else { return nil }
-        let names = [("five_hour", "5h"), ("seven_day", "7d"), ("seven_day_opus", "7d Opus"), ("seven_day_sonnet", "7d Sonnet")]
-        let meters = names.compactMap { key, label -> QuotaMeter? in
-            guard let w = u[key] as? [String: Any], w["utilization"] is NSNumber else { return nil }
-            let reset = parseDate(w["resets_at"])
-            if let reset = reset, reset < Date() { return nil }
-            return QuotaMeter(label: label, percent: num(w["utilization"]), resetsAt: reset,
-                              window: key == "five_hour" ? 5 * 3600 : 7 * 86400)
-        }
+        let meters = claudeMeters(u)
         if meters.isEmpty { return nil }
         let asOf = (cache["fetchedAtMs"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
         return Quota(product: "Claude", plan: nil, meters: meters, asOf: asOf, source: "Claude Code on this Mac")
@@ -939,15 +1026,7 @@ final class ClaudeLive {
         if pl["rate_limits_available"] as? Bool == false { status = ""; last = nil; return nil } // API-key login: no plan limits
         let limits = pl["rate_limits"] as? [String: Any] ?? [:]
         let now = Date()
-        let week: TimeInterval = 7 * 86400
-        let windows: [(String, String, TimeInterval)] = [("five_hour", "5h", 5 * 3600), ("seven_day", "7d", week),
-                                                         ("seven_day_opus", "7d Opus", week), ("seven_day_sonnet", "7d Sonnet", week)]
-        let meters = windows.compactMap { key, label, window -> QuotaMeter? in
-            guard let w = limits[key] as? [String: Any], let u = w["utilization"] as? NSNumber else { return nil }
-            let reset = parseDate(w["resets_at"])
-            if let reset = reset, reset < now { return nil }
-            return QuotaMeter(label: label, percent: u.doubleValue, resetsAt: reset, window: window)
-        }
+        let meters = claudeMeters(limits, now: now)
         guard !meters.isEmpty else { status = "Claude Code returned no limits"; return last }
         status = ""
         last = Quota(product: "Claude", plan: (pl["subscription_type"] as? String)?.capitalized, meters: meters, asOf: now, source: "live")
@@ -1543,11 +1622,11 @@ struct WidgetView: View {
                                         Text("\(Int(rec.rounded()))% \(relative(at)) + usage since")
                                             .help("Last reading: \(Int(rec.rounded()))% \(relative(at)) (\(q.source)). The rest is estimated from usage on all devices since then, so it can be off by a few points.")
                                     } else {
-                                        Text("\(usd(perFull * m.percent / 100)) used · \(q.source)").lineLimit(1)
+                                        Text("\(usd(m.spent ?? perFull * m.percent / 100)) used · \(q.source)").lineLimit(1)
                                     }
                                     Spacer()
                                     Text("100% ≈ \(usd(perFull))").fontWeight(.semibold).foregroundColor(.primary)
-                                        .help("What this plan's full \(m.label) limit is worth at API list prices, from usage in this window up to the last recorded %")
+                                        .help(limitWorthHelp(m, q))
                                 }
                                 .font(.system(size: fs(9.5))).foregroundColor(.secondary).monospacedDigit()
                             }
