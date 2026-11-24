@@ -93,6 +93,33 @@ class TokenmeterTest(unittest.TestCase):
         self.assertEqual(t.missing, {"claude:mystery"})
         self.assertEqual(t.groups["model"]["claude:mystery"][4], 0)
 
+    def test_codex_context_rates_and_cache_write_split(self):
+        fixture = []
+        for project, input_tokens in (("short", 272_000), ("long", 272_001)):
+            fixture.extend([
+                {"timestamp": NOW, "type": "turn_context",
+                 "payload": {"model": "gpt-6.2-sol", "cwd": project}},
+                {"timestamp": NOW, "type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "last_token_usage": {"input_tokens": input_tokens, "cached_input_tokens": 50_000,
+                                         "cache_write_input_tokens": 2_000, "output_tokens": 10_000}}}},
+            ])
+        write(os.path.join(self.tmp.name, "codex", "sessions", "2026", "context.jsonl"), fixture)
+        tally = tokenly.collect(30)
+        short, long = (tally.groups["project"][project] for project in ("short", "long"))
+        self.assertEqual(short[:4], [220_000, 10_000, 50_000, 2_000])
+        self.assertEqual(long[:4], [220_001, 10_000, 50_000, 2_000])
+        self.assertAlmostEqual(short[4], 0.55)
+        self.assertAlmostEqual(long[4], 1.050004)
+        self.assertEqual(tally.missing, set())
+
+    def test_pricing_override_and_synthetic_usage(self):
+        tally = tokenly.Tally("")
+        tally.prices["gpt-6.2-astra"] = (1, 2, 0, 0, 0)
+        tally.add(NOW, "codex:gpt-6.2-astra", "", 300_000, 50_000, 0, 0)
+        tally.add(NOW, "claude:<synthetic>", "", 0, 0, 0, 0)
+        self.assertAlmostEqual(tally.groups["model"]["codex:gpt-6.2-astra"][4], 0.4)
+        self.assertEqual(tally.missing, set())
+
 
 if __name__ == "__main__":
     unittest.main()

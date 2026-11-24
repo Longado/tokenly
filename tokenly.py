@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 __version__ = "1.0.0"
 
-# USD per 1M tokens: input, output, cache_read, cache_write_5m, cache_write_1h.
+# USD per 1M tokens: input, output, cache read, default cache write, extended cache write.
 # Defaults; keep in sync with defaultPrices in macos/main.swift (tests/test_prices.py checks this).
 # Override or add models in ~/.config/tokenly/prices.json, shared with the macOS app.
 PRICES = {
@@ -22,8 +22,12 @@ PRICES = {
     "claude-opus-5-5": (4, 20, 0.20, 5, 8),
     "claude-sonnet-5-5": (2, 10, 0.10, 2.5, 4),
     "claude-haiku-5-5": (0.10, 0.50, 0.01, 0.125, 0.20),
+    "claude-opus-4-8": (5, 25, 0.50, 6.25, 10),
+    "gpt-6.2-astra": (8, 40, 0.40, 10, 20),
+    "gpt-6.2-sol": (2, 10, 0.10, 2.5, 5),
     "gpt-6.1-sol": (2, 10, 0.10, 2.5, 2.5),
 }
+CONTEXT_PRICED_CODEX_MODELS = {"gpt-6.2-astra", "gpt-6.2-sol"}
 FIELDS = ("input", "output", "cache_read", "cache_write", "cost_usd")
 OVERRIDE = os.path.expanduser("~/.config/tokenly/prices.json")
 LEGACY_OVERRIDE = os.path.expanduser("~/.config/tokenmeter/prices.json")  # pre-rename location
@@ -101,16 +105,21 @@ class Tally:
 
     def add(self, ts, model, project, i, o, cr, cw, cw1h=0):
         """`model` is "tool:raw-model"; the model part is normalized before pricing."""
-        if not ts or ts < self.since:
-            return
         tool, _, raw = model.rpartition(":")
+        if not ts or ts < self.since or i + o + cr + cw <= 0 or raw.startswith("<"):
+            return
         name = normalize_model(raw, self.prices)
         model = f"{tool}:{name}" if tool else name
         p = self.prices.get(name)
         if p is None:
             self.missing.add(model)
             p = (0,) * 5
-        cost = (i * p[0] + o * p[1] + cr * p[2] + (cw - cw1h) * p[3] + cw1h * p[4]) / 1e6
+        input_cost = i * p[0] + cr * p[2] + (cw - cw1h) * p[3] + cw1h * p[4]
+        output_cost = o * p[1]
+        if tool == "codex" and name in CONTEXT_PRICED_CODEX_MODELS and i + cr + cw > 272_000 and p == PRICES[name]:
+            input_cost *= 2
+            output_cost *= 1.5
+        cost = (input_cost + output_cost) / 1e6
         for g, k in (("day", ts[:10]), ("provider", provider_of(name)), ("model", model),
                      ("project", project or "?")):
             r = self.groups[g][k]
@@ -138,7 +147,7 @@ def scan_claude(t):
 
 
 def scan_codex(t):
-    # token_count events; last_token_usage is per call and its input includes cached tokens.
+    # last_token_usage input includes both cache reads and cache writes.
     for f in glob.glob(codex_glob(), recursive=True):
         model, project = "codex:?", ""
         for d in read_jsonl(f):
@@ -149,8 +158,9 @@ def scan_codex(t):
             elif p.get("type") == "token_count" and (p.get("info") or {}).get("last_token_usage"):
                 u = p["info"]["last_token_usage"]
                 c = u.get("cached_input_tokens", 0)
-                t.add(d.get("timestamp"), model, project, u.get("input_tokens", 0) - c,
-                      u.get("output_tokens", 0), c, u.get("cache_write_input_tokens", 0))
+                w = u.get("cache_write_input_tokens", 0)
+                t.add(d.get("timestamp"), model, project, u.get("input_tokens", 0) - c - w,
+                      u.get("output_tokens", 0), c, w)
 
 
 def _future(ts):

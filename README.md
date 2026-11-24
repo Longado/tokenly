@@ -23,7 +23,8 @@
 - Plan weeks: cost per 7-day window, full limits used, and resets detected.
 - 13-week activity calendar and every month on record.
 
-**Periods:** Today, 24H, 7D, 30D, 90D, All, or a custom From–To range.
+**Periods:** Today, 24H, 7D, 30D, 90D, All, a custom From–To range, or Since Codex reset. The reset range
+shows Codex usage from the current weekly allowance's reset time, including other devices when enabled.
 
 **Yours to tune:** menu bar format (cost, tokens, two lines, or fullest plan limit), plan-limit alert, which
 sections the overview shows, text size, solid or glass background, plan prices, model prices, launch at login, and
@@ -45,9 +46,9 @@ It makes only these requests, each of which can be turned off in Settings:
 
 | What | How | Default |
 |---|---|---|
-| Live Codex limit | `GET chatgpt.com/backend-api/wham/usage` with the Codex login in `~/.codex/auth.json`, at most every 2 min | on |
+| Live Codex limit | `GET chatgpt.com/backend-api/wham/usage` with the Codex login in `~/.codex/auth.json`, at most every 2 min automatically and on manual refresh | on |
 | Live Claude limit | runs Claude Code in a safe, tool-less mode and asks `get_usage`: no prompt, no tokens, at most every 5 min | on |
-| Other devices | read-only download from your own Vibe Usage account, if that app is linked | off |
+| Other devices | read-only download from your own Vibe Usage account, if that app is linked. Since Codex reset requests usage from the reset time. | off |
 
 Logins are read per request, sent only to their own service, and never stored or logged.
 
@@ -65,8 +66,11 @@ tokenly --json           # machine-readable (also with --quota)
 
 Costs are **API list-price equivalents**, not what a subscription charges. Defaults live in `tokenly.py` (`PRICES`)
 and `macos/main.swift` (`defaultPrices`); a test keeps them identical. Override or add models in
-`~/.config/tokenly/prices.json` (USD per 1M tokens: input, output, cache read, cache write 5m, cache write 1h),
-read by both the app and the CLI. Settings → Pricing → Edit Prices… opens it.
+`~/.config/tokenly/prices.json`, read by both the app and the CLI. Its five amounts are USD per million tokens
+for input, output, cache reads, default cache writes, and extended cache writes. Claude uses 5-minute and
+1-hour write rates. GPT-6.2 uses 30-minute and 12-hour write rates. Codex logs that only report a write count
+use the default duration. Local GPT-6.2 requests above 272,000 input tokens use the long-context rate with
+the built-in prices. Settings → Pricing → Edit Prices… opens the file.
 
 ```json
 { "my-model": [1.0, 5.0, 0.1, 1.25, 2.0] }
