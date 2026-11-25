@@ -11,17 +11,21 @@ let slotSeconds: TimeInterval = 300 // active time = 5-minute slots with at leas
 
 // MARK: - Pricing
 
-// USD per 1M tokens: input, output, cache_read, cache_write_5m, cache_write_1h.
+// USD per 1M tokens: input, output, cache read, default cache write, extended cache write.
 // Keep in sync with PRICES in tokenly.py (tests/test_prices.py checks this).
 let defaultPrices: [String: [Double]] = [
     "claude-fable-5-2": [8, 40, 0.20, 10, 16],
     "claude-opus-5-5": [4, 20, 0.20, 5, 8],
     "claude-sonnet-5-5": [2, 10, 0.10, 2.5, 4],
     "claude-haiku-5-5": [0.10, 0.50, 0.01, 0.125, 0.20],
+    "claude-opus-4-8": [5, 25, 0.50, 6.25, 10],
+    "gpt-6.2-astra": [8, 40, 0.40, 10, 20],
+    "gpt-6.2-sol": [2, 10, 0.10, 2.5, 5],
     "gpt-6.1-sol": [2, 10, 0.10, 2.5, 2.5],
 ]
+let contextPricedCodexModels: Set<String> = ["gpt-6.2-astra", "gpt-6.2-sol"]
 
-/// User overrides and additions, shared with the CLI: {"model": [in, out, cache_read, write_5m, write_1h]}.
+/// User overrides and additions, shared with the CLI.
 let pricesOverrideURL = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/tokenly/prices.json")
 
 func loadPrices() -> [String: [Double]] {
@@ -40,7 +44,7 @@ func openPricesFile() {
     let fm = FileManager.default
     if !fm.fileExists(atPath: pricesOverrideURL.path) {
         try? fm.createDirectory(at: pricesOverrideURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var d: [String: Any] = ["_comment": "USD per 1M tokens: input, output, cache_read, cache_write_5m, cache_write_1h. Used by Tokenly app and CLI."]
+        var d: [String: Any] = ["_comment": "USD per 1M tokens: input, output, cache read, default cache write, extended cache write. Used by Tokenly app and CLI."]
         for (k, v) in loadPrices() { d[k] = v }
         if let data = try? JSONSerialization.data(withJSONObject: d, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: pricesOverrideURL)
@@ -103,7 +107,23 @@ struct Entry {
     var device = thisMac
     var row = Row()
     var slots = Set<Int>() // 5-minute slots with at least one call, for active time
+    var usageByTime: [Date: Row] = [:] // split an hour when a plan resets partway through it
     var provider: String { providerOf(model) }
+    var isCodex: Bool { tool.localizedCaseInsensitiveContains("Codex") }
+
+    func clippedHour(from: Date, to: Date) -> Entry? {
+        let end = hour.addingTimeInterval(3600)
+        guard from < to && hour < to && end > from else { return nil }
+        if (hour >= from && end <= to) || usageByTime.isEmpty { return hour >= from ? self : nil }
+        var result = self
+        result.row = Row()
+        result.slots = []
+        for (at, usage) in usageByTime where at >= from && at < to {
+            result.row.add(usage)
+            result.slots.insert(Int(at.timeIntervalSince1970 / slotSeconds))
+        }
+        return result.row.calls > 0 ? result : nil
+    }
 }
 
 /// One subscription limit window, e.g. "7d" at 88%.
@@ -112,6 +132,9 @@ struct QuotaMeter: Identifiable {
     var window: TimeInterval? = nil // window length, for pace
     var recorded: Double? = nil // the tool's last recorded %, when `percent` is an estimate for now
     var perFull: Double? = nil // API-price cost of 100% of this limit
+    var model: String? = nil // a per-model cap (e.g. "fable"): only that model's usage counts toward it
+    var ofWeekly: Double? = nil // per-model cap: points of the all-models 7d limit this model has used
+    var spent: Double? = nil // API-price cost so far in this window, when it isn't perFull × percent
     var id: String { label }
     /// Share of the window that has passed (0...1), when known.
     var elapsed: Double? {
@@ -139,6 +162,8 @@ struct Report {
     var otherDevicesStatus = "" // why other devices are missing, when the import is on
     var liveStatus = "" // why the live Codex read failed, when it did
     var readings: [QuotaReading] = []
+    var codexResetStart: Date?
+    var codexResetRemote: [Entry]? // requested from the reset instant, already clipped by Vibe Usage
 
     var devices: [String] { Array(Set(entries.map { $0.device })).sorted { $0 == thisMac ? true : $1 == thisMac ? false : $0 < $1 } }
     var firstDay: Date? { entries.map { $0.day }.min() }
@@ -147,6 +172,14 @@ struct Report {
     func entries(from: Date, to: Date) -> [Entry] { entries.filter { $0.hour >= from && $0.hour < to } }
     func total(from: Date, to: Date) -> Row { entries(from: from, to: to).reduce(into: Row()) { $0.add($1.row) } }
     var fullestQuota: Quota? { quotas.max { $0.peak < $1.peak } }
+
+    func codexUsageSinceReset(to end: Date) -> [Entry] {
+        guard let start = codexResetStart, start < end else { return [] }
+        let local = entries.compactMap { e in
+            e.device == thisMac && e.isCodex ? e.clippedHour(from: start, to: end) : nil
+        }
+        return local + (codexResetRemote ?? []).filter { $0.hour < end }
+    }
 
     /// Made-up but realistic data for screenshots (`TOKENLY_DEMO=1`); never mixed with real logs.
     static func demo() -> Report {
@@ -198,6 +231,8 @@ struct Report {
         var r = Report(entries: entries, unpriced: [], quotas: quotas)
         r.readings = readings
         r.quotas = estimateQuotas(r)
+        r.codexResetStart = codexReset.addingTimeInterval(-7 * 86400)
+        r.codexResetRemote = []
         return r
     }
 }
@@ -213,18 +248,33 @@ struct QuotaReading: Codable, Hashable {
     let resetsAt: Date?, window: Double, at: Date
 }
 
-/// Times a limit was reset early (Codex reset credits, provider-wide resets): the % drops within the
-/// same window, or the window restarts before the previous one ended.
-func resetTimes(_ readings: [QuotaReading]) -> [Date] {
-    let rs = readings.sorted { $0.at < $1.at }
-    var out: [Date] = []
+struct LimitReset {
+    let at: Date
+    var previousEnd: Date? = nil // present when the reset changed the plan's schedule
+}
+
+/// Detect a usage drop on the same schedule or a new window that started before the old one ended.
+func limitResets(_ readings: [QuotaReading]) -> [LimitReset] {
+    let rs = readings.filter { $0.resetsAt != nil }.sorted { $0.at < $1.at }
+    var out: [LimitReset] = []
     for (p, c) in zip(rs, rs.dropFirst()) {
-        guard let pr = p.resetsAt, let cr = c.resetsAt else { continue }
-        let sameWindow = abs(cr.timeIntervalSince(pr)) < 3600
-        if sameWindow && c.percent < p.percent - 3 { out.append(c.at) }
-        else if !sameWindow && cr > pr && pr > c.at { out.append(c.at) }
+        guard let previousEnd = p.resetsAt, let end = c.resetsAt else { continue }
+        let start = end.addingTimeInterval(-c.window)
+        if c.window > 0 && end > previousEnd && start >= p.at && start <= c.at && start < previousEnd {
+            out.append(LimitReset(at: start, previousEnd: previousEnd))
+        } else if abs(end.timeIntervalSince(previousEnd)) < 60 && c.at < previousEnd && c.percent < p.percent - 3 {
+            out.append(LimitReset(at: c.at))
+        }
     }
     return out
+}
+
+func limitStart(_ meter: QuotaMeter, product: String, asOf: Date, readings: [QuotaReading]) -> Date? {
+    guard let end = meter.resetsAt, let length = meter.window, length > 0 else { return nil }
+    let from = end.addingTimeInterval(-length)
+    guard from <= asOf && end > asOf else { return nil }
+    return limitResets(readings.filter { $0.product == product && $0.label == meter.label })
+        .map(\.at).filter { $0 >= from && $0 <= asOf }.max() ?? from
 }
 
 /// One past or current 7-day window of a plan.
@@ -234,17 +284,20 @@ struct PlanWeek: Identifiable {
     var id: Date { start }
 }
 
-/// Weekly windows (anchored on the plan's latest reset time) with cost, resets and the week's own 100% value.
+/// Weekly windows with cost, resets and the week's own 100% value. A reset that moves the
+/// schedule ends the preceding window early, preserving its original start.
 func planWeeks(_ r: Report, _ product: String, weeks: Int = 8) -> [PlanWeek] {
     let rs = r.readings.filter { $0.product == product && $0.label == "7d" }
-    guard let anchor = rs.max(by: { $0.at < $1.at })?.resetsAt else { return [] }
-    let resets = resetTimes(rs)
-    return (0..<weeks).compactMap { k -> PlanWeek? in
-        let end = anchor.addingTimeInterval(-Double(k) * 7 * 86400), start = end.addingTimeInterval(-7 * 86400)
-        let cost = productCost(r.entries, product, from: start, to: min(end, Date()))
-        guard cost > 0 else { return nil }
+    guard let anchor = rs.filter({ $0.resetsAt != nil }).max(by: { $0.at < $1.at })?.resetsAt else { return [] }
+    let resets = limitResets(rs), now = Date(), week: TimeInterval = 7 * 86400
+    let reportedEnds = Set(rs.compactMap(\.resetsAt)).sorted()
+    var end = anchor, scheduledEnd = anchor
+    var result: [PlanWeek] = []
+    for _ in 0..<weeks {
+        let start = scheduledEnd.addingTimeInterval(-week)
+        let cost = productCost(r.entries, product, from: start, to: min(end, now))
         let inWeek = rs.filter { $0.at >= start && $0.at < end }
-        let weekResets = resets.filter { $0 >= start && $0 < end }
+        let weekResets = resets.filter { $0.at >= start && $0.at < end }.map(\.at)
         // 100% value: in the stretch since the last reset before a reading, cost ÷ % at that reading.
         var perFull: Double?
         if let best = inWeek.filter({ $0.percent >= 5 }).max(by: { $0.percent < $1.percent }) {
@@ -252,9 +305,20 @@ func planWeeks(_ r: Report, _ product: String, weeks: Int = 8) -> [PlanWeek] {
             let c = productCost(r.entries, product, from: segStart, to: best.at)
             if c > 0 { perFull = c / best.percent * 100 }
         }
-        return PlanWeek(start: start, end: end, cost: cost, resets: weekResets.count,
-                        peak: inWeek.map { $0.percent }.max(), perFull: perFull)
+        if cost > 0 || !weekResets.isEmpty {
+            result.append(PlanWeek(start: start, end: end, cost: cost, resets: weekResets.count,
+                                   peak: inWeek.map { $0.percent }.max(), perFull: perFull))
+        }
+        if let previousEnd = resets.last(where: { $0.at == start && $0.previousEnd != nil })?.previousEnd {
+            end = start
+            scheduledEnd = previousEnd
+        } else {
+            // A new period can start with the next request, leaving a gap after the previous deadline.
+            end = reportedEnds.last { $0 <= start && $0 > start.addingTimeInterval(-week) } ?? start
+            scheduledEnd = end
+        }
     }
+    return result
 }
 
 /// Keeps every plan reading Tokenly has seen, so weeks stay measurable after the tools' logs are gone.
@@ -286,11 +350,11 @@ final class ReadingStore {
 
 /// API-price cost of one product's usage in [from, to), across every device (plan limits are per account).
 /// Other devices report whole days, so a day that only partly overlaps counts in proportion.
-func productCost(_ entries: [Entry], _ product: String, from: Date, to: Date = Date()) -> Double {
+func productCost(_ entries: [Entry], _ product: String, from: Date, to: Date = Date(), model: String? = nil) -> Double {
     let key = product.lowercased(), now = Date()
     return entries.reduce(0) { acc, e in
-        guard e.tool.lowercased().contains(key) else { return acc }
-        if e.device == thisMac { return e.hour >= from && e.hour < to ? acc + e.row.cost : acc }
+        guard e.tool.lowercased().contains(key), model.map({ e.model.lowercased().contains($0) }) ?? true else { return acc }
+        if e.device == thisMac { return acc + (e.clippedHour(from: from, to: to)?.row.cost ?? 0) }
         let dayEnd = min(cal.date(byAdding: .day, value: 1, to: e.day)!, now)
         let length = dayEnd.timeIntervalSince(e.day)
         let overlap = max(0, min(dayEnd, to).timeIntervalSince(max(e.day, from)))
@@ -300,24 +364,119 @@ func productCost(_ entries: [Entry], _ product: String, from: Date, to: Date = D
 
 /// The tools record plan usage only when they run on this Mac, so a reading goes stale while you work
 /// elsewhere. Estimate it for now: last recorded % plus usage since, at the window's cost-per-% rate.
+private func with(_ m: QuotaMeter, percent: Double) -> QuotaMeter {
+    var out = QuotaMeter(label: m.label, percent: min(100, percent), resetsAt: m.resetsAt, window: m.window,
+                         recorded: m.recorded, perFull: m.perFull, model: m.model, ofWeekly: m.ofWeekly)
+    out.spent = m.spent.map { $0 * percent / m.percent }
+    return out
+}
+
+/// Claude's plan limits, from a live get_usage reply's `rate_limits` or the copy in ~/.claude.json. Besides the
+/// classic windows, plans can cap a model on its own (`limits` entries of kind weekly_scoped, or `model_scoped`),
+/// and `weekly_scoped_shares` says how many points of the all-models week that model used.
+func claudeMeters(_ u: [String: Any], now: Date = Date()) -> [QuotaMeter] {
+    let week: TimeInterval = 7 * 86400
+    func live(_ reset: Date?) -> Bool { reset.map { $0 >= now } ?? true }
+    var meters = [("five_hour", "5h", 5 * 3600.0), ("seven_day", "7d", week), ("seven_day_opus", "7d Opus", week),
+                  ("seven_day_sonnet", "7d Sonnet", week)].compactMap { key, label, window -> QuotaMeter? in
+        guard let w = u[key] as? [String: Any], let p = w["utilization"] as? NSNumber else { return nil }
+        let reset = parseDate(w["resets_at"])
+        return live(reset) ? QuotaMeter(label: label, percent: p.doubleValue, resetsAt: reset, window: window) : nil
+    }
+    let limits = u["limits"] as? [[String: Any]] ?? []
+    func modelName(_ l: [String: Any]) -> String? {
+        ((l["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String
+    }
+    let shareList = u["weekly_scoped_shares"] as? [[String: Any]] ?? []
+    var shares: [String: Double] = [:]
+    for s in shareList {
+        guard let i = (s["limit_index"] as? NSNumber)?.intValue, limits.indices.contains(i),
+              let name = modelName(limits[i]), let used = s["used_percent_of_weekly"] as? NSNumber else { continue }
+        shares[name] = used.doubleValue
+    }
+    var scoped: [(String, Double, Date?)] = limits.compactMap { l in
+        guard l["kind"] as? String == "weekly_scoped", let name = modelName(l), let p = l["percent"] as? NSNumber else { return nil }
+        return (name, p.doubleValue, parseDate(l["resets_at"]))
+    }
+    for s in u["model_scoped"] as? [[String: Any]] ?? [] {
+        guard let name = s["display_name"] as? String, let p = s["utilization"] as? NSNumber,
+              !scoped.contains(where: { $0.0 == name }) else { continue }
+        scoped.append((name, p.doubleValue, parseDate(s["resets_at"])))
+    }
+    // Some replies leave out `limits`; with one share and one per-model cap there is only one way to pair them.
+    if shares.isEmpty, shareList.count == 1, scoped.count == 1,
+       let used = shareList[0]["used_percent_of_weekly"] as? NSNumber { shares[scoped[0].0] = used.doubleValue }
+    for (name, percent, reset) in scoped where !name.isEmpty && live(reset) && !meters.contains(where: { $0.label == "7d \(name)" }) {
+        meters.append(QuotaMeter(label: "7d \(name)", percent: percent, resetsAt: reset, window: week,
+                                 model: name.lowercased(), ofWeekly: shares[name]))
+    }
+    return meters
+}
+
 func estimateQuotas(_ r: Report) -> [Quota] {
     r.quotas.map { q in
         Quota(product: q.product, plan: q.plan, meters: q.meters.map { m in
-            guard let w = m.window, let reset = m.resetsAt, let asOf = q.asOf, m.percent >= 5 else { return m }
-            let windowStart = reset.addingTimeInterval(-w)
-            let lastReset = resetTimes(r.readings.filter { $0.product == q.product && $0.label == m.label })
-                .filter { $0 >= windowStart && $0 <= asOf }.max()
-            let before = productCost(r.entries, q.product, from: max(windowStart, lastReset ?? windowStart), to: asOf)
+            guard let asOf = q.asOf, m.percent >= 5,
+                  let start = limitStart(m, product: q.product, asOf: asOf, readings: r.readings) else { return m }
+            let recent = Date().timeIntervalSince(asOf) <= 5 * 60
+            let preciseRemote = q.product == "Codex" && start == r.codexResetStart && recent ? r.codexResetRemote : nil
+            let before = preciseRemote.map { remote in
+                // The live reading and the reset-window query are made together on a refresh.
+                productCost(r.entries.filter { $0.device == thisMac }, q.product, from: start, to: asOf)
+                    + remote.reduce(0) { $0 + $1.row.cost }
+            } ?? productCost(r.entries, q.product, from: start, to: asOf)
             guard before > 0 else { return m }
-            let perFull = before / m.percent * 100
-            let after = Date().timeIntervalSince(asOf) > 900 ? productCost(r.entries, q.product, from: asOf) : 0
+            let stale = Date().timeIntervalSince(asOf) > 900
             var out = m
-            out.perFull = perFull
-            if after > 0 { out.recorded = m.percent; out = QuotaMeter(label: m.label, percent: min(100, m.percent + after / perFull * 100),
-                                                                      resetsAt: reset, window: w, recorded: m.percent, perFull: perFull) }
+            if let model = m.model {
+                // A per-model cap counts only that model's usage.
+                let spent = productCost(r.entries, q.product, from: start, to: asOf, model: model)
+                guard spent > 0 else { return m }
+                out.perFull = spent / m.percent * 100
+                let after = stale ? productCost(r.entries, q.product, from: asOf, model: model) : 0
+                if after > 0 { out.recorded = m.percent; out = with(out, percent: m.percent + after / out.perFull! * 100) }
+                return out
+            }
+            // The all-models week: Claude says how many of its points each capped model used, so each model's
+            // usage is priced at its own rate instead of one blended $ per %, which moves whenever the mix does.
+            var rates: [(model: String?, perPoint: Double)] = []
+            var restCost = before, restPoints = m.percent
+            if m.label == "7d" {
+                for s in q.meters where s.model != nil && (s.ofWeekly ?? 0) >= 1 {
+                    let c = productCost(r.entries, q.product, from: start, to: asOf, model: s.model)
+                    guard c > 0 else { continue }
+                    rates.append((s.model, c / s.ofWeekly!)); restCost -= c; restPoints -= s.ofWeekly!
+                }
+            }
+            if !rates.isEmpty && (restPoints < 1 || restCost <= 0) { rates = [] }
+            let restRate = rates.isEmpty ? before / m.percent : restCost / restPoints
+            out.perFull = restRate * 100
+            if !rates.isEmpty { out.spent = before }
+            if stale {
+                var points = 0.0, scopedAfter = 0.0
+                for (model, perPoint) in rates {
+                    let c = productCost(r.entries, q.product, from: asOf, model: model)
+                    points += c / perPoint; scopedAfter += c
+                }
+                points += (productCost(r.entries, q.product, from: asOf) - scopedAfter) / restRate
+                if points > 0 { out.recorded = m.percent; out = with(out, percent: m.percent + points) }
+            }
             return out
         }, asOf: q.asOf, source: q.source, resetCredits: q.resetCredits)
     }
+}
+
+/// Tooltip for "100% ≈ $": which usage the value is measured on.
+func limitWorthHelp(_ m: QuotaMeter, _ q: Quota) -> String {
+    if let model = m.model {
+        let share = m.ofWeekly.map { " It has used \(Int($0.rounded())) points of the all-models week." } ?? ""
+        return "What this \(m.label) cap is worth at API list prices, from \(model.capitalized) usage in this window.\(share)"
+    }
+    let capped = q.meters.filter { $0.model != nil && $0.ofWeekly != nil }.map { $0.label.replacingOccurrences(of: "7d ", with: "") }
+    if m.label == "7d", m.spent != nil, !capped.isEmpty {
+        return "What the full week is worth at API list prices if spent on models other than \(capped.joined(separator: ", ")). Claude reports how many points those used, so each model is counted at its own rate."
+    }
+    return "What this plan's full \(m.label) limit is worth at API list prices, from usage in this window up to the last recorded %"
 }
 
 func activeSeconds(_ es: [Entry]) -> Double {
@@ -362,21 +521,25 @@ final class Scanner {
     var liveCodex = true
     var liveStatus: String { [liveCodex ? codexLive.status : "", liveClaude ? claudeLive.status : ""].first { !$0.isEmpty } ?? "" }
 
-    /// Other devices' daily buckets as entries, priced with our table when we know the model.
-    func remoteEntries() -> [Entry] {
-        let (buckets, host) = vibe.buckets()
+    /// Other devices' buckets, priced with our table when we know the model.
+    func remoteEntries(_ buckets: [VibeImporter.Bucket], excluding host: String?, useBucketTime: Bool = false) -> [Entry] {
         return buckets.compactMap { b in
-            guard b.hostname != host, let day = b.day else { return nil }
+            guard b.hostname != host, let at = parseDate(b.bucketStart) else { return nil }
+            let day = cal.startOfDay(for: at)
             let model = normalizeModel(b.model, prices)
             let i = b.inputTokens ?? 0, o = (b.outputTokens ?? 0) + (b.reasoningOutputTokens ?? 0), cr = b.cachedInputTokens ?? 0
             let w5 = b.cacheCreation5mTokens ?? 0, w1 = b.cacheCreation1hTokens ?? 0
             var r = Row(input: i, output: o, cacheRead: cr, cacheWrite: w5 + w1, cost: b.estimatedCost ?? 0)
             if let p = prices[model] {
-                r.cost = (i * p[0] + o * p[1] + cr * p[2] + w5 * p[3] + w1 * p[4]) / 1e6
+                // An imported bucket has no per-request context lengths. Keep the source's estimate when available.
+                if !contextPricedCodexModels.contains(model) || p != defaultPrices[model] || b.estimatedCost == nil {
+                    r.cost = (i * p[0] + o * p[1] + cr * p[2] + w5 * p[3] + w1 * p[4]) / 1e6
+                }
                 r.saved = cr * (p[0] - p[2]) / 1e6
             }
             let project = b.project == nil || b.project == "unknown" ? "" : b.project!
-            return Entry(hour: day, day: day, tool: b.source, model: model, project: project, device: b.hostname, row: r)
+            return Entry(hour: useBucketTime ? at : day, day: day, tool: b.source, model: model, project: project,
+                         device: b.hostname, row: r)
         }
     }
 
@@ -386,15 +549,22 @@ final class Scanner {
         let model = normalizeModel(rawModel, prices)
         let p = prices[model] ?? [0, 0, 0, 0, 0]
         if prices[model] == nil { st.unpriced.insert(model) }
-        let cost = (i * p[0] + o * p[1] + cr * p[2] + (cw - cw1h) * p[3] + cw1h * p[4]) / 1e6
-        let r = Row(input: i, output: o, cacheRead: cr, cacheWrite: cw, cost: cost, saved: cr * (p[0] - p[2]) / 1e6, calls: 1)
+        let longContext = tool == "Codex" && contextPricedCodexModels.contains(model)
+            && i + cr + cw > 272_000 && p == defaultPrices[model]
+        let inputMultiplier = longContext ? 2.0 : 1.0
+        let outputMultiplier = longContext ? 1.5 : 1.0
+        let inputCost = i * p[0] + cr * p[2] + (cw - cw1h) * p[3] + cw1h * p[4]
+        let cost = (inputCost * inputMultiplier + o * p[1] * outputMultiplier) / 1e6
+        let saved = cr * (p[0] - p[2]) * inputMultiplier / 1e6
+        let r = Row(input: i, output: o, cacheRead: cr, cacheWrite: cw, cost: cost, saved: saved, calls: 1)
         let hour = cal.dateInterval(of: .hour, for: date)!.start
-        let key = "\(hour.timeIntervalSince1970)|\(model)|\(project)"
+        let key = "\(hour.timeIntervalSince1970)|\(tool)|\(model)|\(project)"
         if st.buckets[key] == nil {
             st.buckets[key] = Entry(hour: hour, day: cal.startOfDay(for: date), tool: tool, model: model, project: project)
         }
         st.buckets[key]!.row.add(r)
         st.buckets[key]!.slots.insert(Int(date.timeIntervalSince1970 / slotSeconds))
+        st.buckets[key]!.usageByTime[date, default: Row()].add(r)
     }
 
     /// .jsonl files under `dir` modified since `since`.
@@ -472,9 +642,9 @@ final class Scanner {
                     if let c = p["cwd"] as? String { st.project = (c as NSString).lastPathComponent }
                 } else if p["type"] as? String == "token_count", let date = parseDate(d["timestamp"]) {
                     if let u = (p["info"] as? [String: Any])?["last_token_usage"] as? [String: Any] {
-                        let c = num(u["cached_input_tokens"]) // input includes cached tokens
-                        add(st, date, "Codex", st.model, st.project, num(u["input_tokens"]) - c,
-                            num(u["output_tokens"]), c, num(u["cache_write_input_tokens"]))
+                        let c = num(u["cached_input_tokens"]), w = num(u["cache_write_input_tokens"])
+                        add(st, date, "Codex", st.model, st.project, num(u["input_tokens"]) - c - w,
+                            num(u["output_tokens"]), c, w)
                     }
                     if let rl = p["rate_limits"] as? [String: Any] {
                         for k in ["primary", "secondary"] {
@@ -522,10 +692,9 @@ final class Scanner {
                      source: "live via Vibe Usage", resetCredits: (d["resetCreditsCount"] as? NSNumber)?.intValue)
     }
 
-    /// Codex: the newer of Vibe Usage's live reading and the newest `rate_limits` in Codex's session logs.
-    /// Windows that already reset are dropped.
-    func codexQuota() -> Quota? {
-        if liveCodex, let live = codexLive.quota() { return live }
+    /// Codex: live when available, otherwise the newer of Vibe Usage's cached reading and Codex's logs.
+    func codexQuota(forceRefresh: Bool) -> Quota? {
+        if liveCodex, let live = codexLive.quota(forceRefresh: forceRefresh) { return live }
         let vibeLive = vibeCodexQuota()
         guard let (at, rl) = files.values.compactMap({ $0.rateLimits }).max(by: { $0.at < $1.at }) else { return vibeLive }
         if let v = vibeLive, let vAt = v.asOf, vAt > at { return v }
@@ -550,20 +719,13 @@ final class Scanner {
               let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let cache = d["cachedUsageUtilization"] as? [String: Any],
               let u = cache["utilization"] as? [String: Any] else { return nil }
-        let names = [("five_hour", "5h"), ("seven_day", "7d"), ("seven_day_opus", "7d Opus"), ("seven_day_sonnet", "7d Sonnet")]
-        let meters = names.compactMap { key, label -> QuotaMeter? in
-            guard let w = u[key] as? [String: Any], w["utilization"] is NSNumber else { return nil }
-            let reset = parseDate(w["resets_at"])
-            if let reset = reset, reset < Date() { return nil }
-            return QuotaMeter(label: label, percent: num(w["utilization"]), resetsAt: reset,
-                              window: key == "five_hour" ? 5 * 3600 : 7 * 86400)
-        }
+        let meters = claudeMeters(u)
         if meters.isEmpty { return nil }
         let asOf = (cache["fetchedAtMs"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
         return Quota(product: "Claude", plan: nil, meters: meters, asOf: asOf, source: "Claude Code on this Mac")
     }
 
-    func run(otherDevices: Bool = false) -> Report {
+    func run(otherDevices: Bool = false, forceCodexRefresh: Bool = false, includeCodexReset: Bool = false) -> Report {
         let p = loadPrices()
         if p != prices { prices = p; files = [:]; seenClaude = [] } // costs are computed while parsing
         let since = daysAgo(scanDays - 1)
@@ -578,13 +740,16 @@ final class Scanner {
                 if merged[k] == nil { merged[k] = e } else {
                     merged[k]!.row.add(e.row)
                     merged[k]!.slots.formUnion(e.slots)
+                    for (at, usage) in e.usageByTime { merged[k]!.usageByTime[at, default: Row()].add(usage) }
                 }
             }
         }
+        let codex = codexQuota(forceRefresh: forceCodexRefresh)
         var report = Report(entries: Array(merged.values), unpriced: unpriced,
-                            quotas: [claudeQuota(), codexQuota()].compactMap { $0 })
+                            quotas: [claudeQuota(), codex].compactMap { $0 })
         if otherDevices {
-            report.entries += remoteEntries()
+            let (buckets, host) = vibe.buckets()
+            report.entries += remoteEntries(buckets, excluding: host)
             report.otherDevicesStatus = vibe.status
         }
         var fresh = files.values.flatMap { $0.readings }
@@ -594,6 +759,16 @@ final class Scanner {
                                                  resetsAt: $0.resetsAt, window: $0.window ?? 0, at: at) }
         }
         report.readings = readingStore.merge(fresh)
+        if let codex, let at = codex.asOf,
+           let weekly = codex.meters.first(where: { $0.label == "7d" }),
+           let end = weekly.resetsAt, end > Date(),
+           let start = limitStart(weekly, product: codex.product, asOf: at, readings: report.readings) {
+            report.codexResetStart = start
+            if otherDevices && includeCodexReset,
+               let (buckets, host) = vibe.buckets(since: start, force: forceCodexRefresh) {
+                report.codexResetRemote = remoteEntries(buckets, excluding: host, useBucketTime: true).filter(\.isCodex)
+            }
+        }
         report.quotas = estimateQuotas(report)
         return report
     }
@@ -620,6 +795,7 @@ final class VibeImporter {
     private var recent: [Bucket] = []
     private var lastRecent = Date.distantPast
     private var cache: Cache?
+    private var resetUsage: (start: Date, account: String?, at: Date, buckets: [Bucket]?)?
     private let recentDays = 8
     private let cacheURL = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Tokenly/vibe-history.json")
@@ -657,6 +833,21 @@ final class VibeImporter {
         }.resume()
         done.wait()
         return out
+    }
+
+    /// Vibe Usage applies the exact cutoff before grouping into its hourly or daily buckets.
+    func buckets(since start: Date, force: Bool) -> ([Bucket], String?)? {
+        guard let cfg = Self.config() else { return nil }
+        let account = cache?.account
+        if !force, let resetUsage, resetUsage.start == start, resetUsage.account == account,
+           Date().timeIntervalSince(resetUsage.at) < 900 {
+            return resetUsage.buckets.map { ($0, cfg.host) }
+        }
+        let originalStatus = status
+        defer { status = originalStatus }
+        let buckets = get(["from": isoFrac.string(from: start)], cfg)
+        resetUsage = (start, account, Date(), buckets)
+        return buckets.map { ($0, cfg.host) }
     }
 
     /// Buckets of every device on the account (callers drop this Mac's own).
@@ -701,7 +892,7 @@ final class VibeImporter {
 
 /// Reads the live Codex plan usage the way the Codex app does: `GET {base}/wham/usage` with the ChatGPT login
 /// Codex stores in ~/.codex/auth.json. The token is read per request, sent only to OpenAI, never stored or logged.
-/// At most one request every two minutes; between requests the last answer is reused.
+/// Automatic requests are throttled to every two minutes. A manual refresh asks immediately.
 final class CodexLive {
     private(set) var status = ""
     private var last: Quota?
@@ -723,14 +914,14 @@ final class CodexLive {
         return URL(string: base + (base.contains("/backend-api") ? "/wham/usage" : "/api/codex/usage"))!
     }
 
-    func quota() -> Quota? {
-        if Date().timeIntervalSince(lastAttempt) < minInterval { return last }
+    func quota(forceRefresh: Bool = false) -> Quota? {
+        if !forceRefresh && Date().timeIntervalSince(lastAttempt) < minInterval { return status.isEmpty ? last : nil }
         lastAttempt = Date()
         guard let data = FileManager.default.contents(atPath: home + "/auth.json"),
               let auth = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let tokens = auth["tokens"] as? [String: Any],
               let token = tokens["access_token"] as? String, !token.isEmpty else {
-            status = "Not signed in to Codex with ChatGPT"; return last
+            status = "Not signed in to Codex with ChatGPT"; return nil
         }
         var req = URLRequest(url: endpoint(), timeoutInterval: 10)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -745,7 +936,7 @@ final class CodexLive {
         done.wait()
         guard code == 200, let body = body, let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             status = code == 401 || code == 403 ? "Codex login expired — open Codex to sign in again" : "Live Codex read failed (\(code == 0 ? "offline" : "HTTP \(code)"))"
-            return last
+            return nil
         }
         let now = Date()
         let rl = obj["rate_limit"] as? [String: Any] ?? [:]
@@ -835,15 +1026,7 @@ final class ClaudeLive {
         if pl["rate_limits_available"] as? Bool == false { status = ""; last = nil; return nil } // API-key login: no plan limits
         let limits = pl["rate_limits"] as? [String: Any] ?? [:]
         let now = Date()
-        let week: TimeInterval = 7 * 86400
-        let windows: [(String, String, TimeInterval)] = [("five_hour", "5h", 5 * 3600), ("seven_day", "7d", week),
-                                                         ("seven_day_opus", "7d Opus", week), ("seven_day_sonnet", "7d Sonnet", week)]
-        let meters = windows.compactMap { key, label, window -> QuotaMeter? in
-            guard let w = limits[key] as? [String: Any], let u = w["utilization"] as? NSNumber else { return nil }
-            let reset = parseDate(w["resets_at"])
-            if let reset = reset, reset < now { return nil }
-            return QuotaMeter(label: label, percent: u.doubleValue, resetsAt: reset, window: window)
-        }
+        let meters = claudeMeters(limits, now: now)
         guard !meters.isEmpty else { status = "Claude Code returned no limits"; return last }
         status = ""
         last = Quota(product: "Claude", plan: (pl["subscription_type"] as? String)?.capitalized, meters: meters, asOf: now, source: "live")
@@ -980,21 +1163,28 @@ let alertThresholds = [("Off", 0), ("70%", 70), ("80%", 80), ("90%", 90)]
 
 enum Preset: String, CaseIterable, Identifiable {
     case today = "Today", h24 = "24H", week = "7D", month = "30D", quarter = "90D", all = "All", custom = "Custom"
+    case codexReset = "Since Codex reset"
     var id: String { rawValue }
-    var days: Int { [1, 1, 7, 30, 90, 0, 0][Preset.allCases.firstIndex(of: self)!] }
-    var title: String { ["Today", "Last 24 hours", "Last 7 days", "Last 30 days", "Last 90 days", "All time", "Custom range…"][Preset.allCases.firstIndex(of: self)!] }
+    var days: Int { [1, 1, 7, 30, 90, 0, 0, 0][Preset.allCases.firstIndex(of: self)!] }
+    var title: String { ["Today", "Last 24 hours", "Last 7 days", "Last 30 days", "Last 90 days", "All time", "Custom range…", "Since Codex reset"][Preset.allCases.firstIndex(of: self)!] }
 }
 
 /// A time range [from, to), charted by `unit` (.hour, .day or .month).
 struct Span {
     let from: Date, to: Date, days: Int, title: String, unit: Calendar.Component
+    var codexWindow = false
     var hourly: Bool { unit == .hour }
+    var firstBucket: Date { codexWindow ? cal.dateInterval(of: unit, for: from)!.start : from }
+    var hourCount: Int { codexWindow ? max(1, Int(ceil(to.timeIntervalSince(firstBucket) / 3600))) : 24 }
     var previous: (from: Date, to: Date) { (from.addingTimeInterval(-to.timeIntervalSince(from)), from) }
 }
 
 final class Store: ObservableObject {
+    private static let codexResetPreference = "showUsageSinceCodexReset"
     @Published var report: Report?
-    @Published var preset = Preset.today { didSet { hover = nil } }
+    @Published var preset = UserDefaults.standard.bool(forKey: Store.codexResetPreference) ? Preset.codexReset : .today {
+        didSet { hover = nil }
+    }
     @Published var pickedDay: Date? { didSet { hover = nil } }
     @Published var provider: String? // nil = all providers
     @Published var model: String? // nil = all models
@@ -1012,14 +1202,23 @@ final class Store: ObservableObject {
     private let scanner = Scanner()
     private let queue = DispatchQueue(label: "tokenly.scan", qos: .utility) // serializes scanner access
 
+    func selectPreset(_ selection: Preset) {
+        preset = selection
+        pickedDay = nil
+        UserDefaults.standard.set(selection == .codexReset, forKey: Self.codexResetPreference)
+        if selection == .codexReset && Prefs.shared.includeOtherDevices && report?.codexResetRemote == nil { refresh() }
+    }
+
     @Published var refreshing = false
-    func refresh() {
+    func refresh(forceCodexRefresh: Bool = false) {
         refreshing = true
+        let includeCodexReset = preset == .codexReset
         queue.async {
             self.scanner.liveCodex = Prefs.shared.liveCodex
             self.scanner.liveClaude = Prefs.shared.liveClaude
             var r = ProcessInfo.processInfo.environment["TOKENLY_DEMO"] != nil ? Report.demo()
-                : self.scanner.run(otherDevices: Prefs.shared.includeOtherDevices)
+                : self.scanner.run(otherDevices: Prefs.shared.includeOtherDevices, forceCodexRefresh: forceCodexRefresh,
+                                   includeCodexReset: includeCodexReset)
             r.liveStatus = self.scanner.liveStatus
             DispatchQueue.main.async { self.report = r; self.refreshing = false; self.onUpdate?(r) }
         }
@@ -1035,6 +1234,11 @@ final class Store: ObservableObject {
         case .h24:
             let next = cal.dateInterval(of: .hour, for: Date())!.end
             return Span(from: next.addingTimeInterval(-86400), to: next, days: 1, title: preset.title, unit: .hour)
+        case .codexReset:
+            let now = Date(), start = report?.codexResetStart ?? now
+            let days = (cal.dateComponents([.day], from: cal.startOfDay(for: start), to: cal.startOfDay(for: now)).day ?? 0) + 1
+            return Span(from: start, to: now, days: days, title: preset.title,
+                        unit: now.timeIntervalSince(start) <= 86400 ? .hour : .day, codexWindow: true)
         case .custom:
             let from = cal.startOfDay(for: min(customFrom, customTo)), last = cal.startOfDay(for: max(customFrom, customTo))
             let to = cal.date(byAdding: .day, value: 1, to: last)!
@@ -1113,12 +1317,18 @@ struct WidgetView: View {
     var provider: String? { store.provider }
     var scopeName: String { store.model ?? store.project ?? provider ?? "All providers" }
 
+    func matchesFilters(_ entry: Entry) -> Bool {
+        (provider == nil || entry.provider == provider) && (store.model == nil || entry.model == store.model)
+            && (store.project == nil || entry.project == store.project) && (store.device == nil || entry.device == store.device)
+    }
+
     /// Entries in [from, to) for the selected provider / model / project (all when nil).
     func scoped(_ r: Report, _ from: Date, _ to: Date) -> [Entry] {
-        r.entries(from: from, to: to).filter {
-            (provider == nil || $0.provider == provider) && (store.model == nil || $0.model == store.model)
-                && (store.project == nil || $0.project == store.project) && (store.device == nil || $0.device == store.device)
-        }
+        r.entries(from: from, to: to).filter(matchesFilters)
+    }
+
+    func periodEntries(_ r: Report, _ span: Span) -> [Entry] {
+        span.codexWindow ? r.codexUsageSinceReset(to: span.to).filter(matchesFilters) : scoped(r, span.from, span.to)
     }
     func sum(_ es: [Entry]) -> Row { es.reduce(into: Row()) { $0.add($1.row) } }
     /// Providers that have any usage in the scan window, in fixed order.
@@ -1224,10 +1434,8 @@ struct WidgetView: View {
     func controls(_ r: Report) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 5) {
-                ForEach(Preset.allCases) { p in
-                    pill(p == .custom ? "Custom" : p.rawValue, pickedDay == nil && store.preset == p) {
-                        store.preset = p; store.pickedDay = nil
-                    }
+                ForEach(Preset.allCases.filter { $0 != .codexReset }) { p in
+                    pill(p.rawValue, pickedDay == nil && store.preset == p) { store.selectPreset(p) }
                 }
                 Spacer(minLength: 0)
             }
@@ -1244,10 +1452,14 @@ struct WidgetView: View {
                     Spacer(minLength: 0)
                 }
             }
-            if pickedDay != nil || r.devices.count > 1 {
+            let showCodexReset = r.codexResetStart != nil || store.preset == .codexReset
+            if showCodexReset || pickedDay != nil || r.devices.count > 1 {
                 HStack(spacing: 6) {
                     if let d = pickedDay {
                         pill("\(dayLabel(d))  ✕", true) { store.pickedDay = nil }.help("Back to \(store.preset.title)")
+                    } else if showCodexReset {
+                        pill(Preset.codexReset.rawValue, store.preset == .codexReset) { store.selectPreset(.codexReset) }
+                            .help("Show usage since your last Codex weekly reset")
                     }
                     Spacer(minLength: 0)
                     if r.devices.count > 1 {
@@ -1367,7 +1579,7 @@ struct WidgetView: View {
 
     func quotaColor(_ pct: Double) -> Color { pct >= 90 ? .red : pct >= 70 ? .orange : accent }
 
-    /// Subscription windows as the tools last recorded them locally (no network).
+    /// Latest subscription usage and available banked resets.
     func quotas(_ r: Report) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             cap("Plan limits")
@@ -1381,9 +1593,9 @@ struct WidgetView: View {
                                 .background(Capsule().fill(Color.primary.opacity(0.09))).foregroundColor(.secondary)
                         }
                         Spacer()
-                        if let c = q.resetCredits, c > 0 {
+                        if let c = q.resetCredits {
                             Text("↻ \(c) reset\(c == 1 ? "" : "s") left").font(.system(size: fs(9.5))).foregroundColor(.secondary)
-                                .help("Reset credits you can redeem in Codex")
+                                .help("Banked resets available in Codex")
                         }
                         if prefs.showLimitDetails, let at = q.asOf, Date().timeIntervalSince(at) > 3600 {
                             Text("as of \(relative(at))").font(.system(size: fs(9.5))).foregroundColor(.secondary)
@@ -1410,11 +1622,11 @@ struct WidgetView: View {
                                         Text("\(Int(rec.rounded()))% \(relative(at)) + usage since")
                                             .help("Last reading: \(Int(rec.rounded()))% \(relative(at)) (\(q.source)). The rest is estimated from usage on all devices since then, so it can be off by a few points.")
                                     } else {
-                                        Text("\(usd(perFull * m.percent / 100)) used · \(q.source)").lineLimit(1)
+                                        Text("\(usd(m.spent ?? perFull * m.percent / 100)) used · \(q.source)").lineLimit(1)
                                     }
                                     Spacer()
                                     Text("100% ≈ \(usd(perFull))").fontWeight(.semibold).foregroundColor(.primary)
-                                        .help("What this plan's full \(m.label) limit is worth at API list prices, from usage in this window up to the last recorded %")
+                                        .help(limitWorthHelp(m, q))
                                 }
                                 .font(.system(size: fs(9.5))).foregroundColor(.secondary).monospacedDigit()
                             }
@@ -1448,31 +1660,39 @@ struct WidgetView: View {
 
     func hero(_ r: Report) -> some View {
         let g = store.span
-        let es = scoped(r, g.from, g.to)
+        let es = periodEntries(r, g)
         let cur = sum(es)
-        let prev = store.preset == .all && pickedDay == nil ? Row() : sum(scoped(r, g.previous.from, g.previous.to))
+        let compare = !g.codexWindow && (store.preset != .all || pickedDay != nil)
+        let prev = compare ? sum(scoped(r, g.previous.from, g.previous.to)) : Row()
         let remote = es.contains { $0.device != thisMac }
         return VStack(alignment: .leading, spacing: 8) {
-            if scopeName != "All providers" { cap(scopeName) } // the period is already on the pills
-            // Cost and tokens side by side, each with its change vs the previous period.
-            HStack(alignment: .top, spacing: fs(22)) {
-                headline(usd(cur.cost), "Cost", cur.cost, prev.cost, g.days)
-                headline(tok(cur.tokens), "Tokens", cur.tokens, prev.tokens, g.days)
-                Spacer(minLength: 0)
-            }
-            if prefs.showInsight {
-                Text(insight(es, cur, g.days)).font(.system(size: fs(12))).foregroundColor(.primary.opacity(0.85))
-            }
-            if prefs.showDetails {
-            Text(cur.calls == 0 ? "\(tok(cur.tokens)) tokens"
-                 : "\(tok(cur.tokens)) tokens · \(Int(cur.calls)) calls · \(duration(activeSeconds(es))) active\(remote ? " on this Mac" : "")")
-                .font(.system(size: fs(10.5))).foregroundColor(.secondary).monospacedDigit()
-                .help("Active time: 5-minute slots with at least one model call")
-            }
-            if prefs.showTrend { trend(r, g) }
-            if prefs.showTrend && prefs.showDetails && remote && g.hourly {
-                Text("Other devices report daily totals; they appear in the first hour.")
-                    .font(.system(size: fs(9.5))).foregroundColor(.secondary)
+            if g.codexWindow && r.codexResetStart == nil {
+                Text("Codex reset time unavailable").font(.system(size: fs(11))).foregroundColor(.secondary)
+            } else {
+                if g.codexWindow { cap("Since \(g.from.formatted(.dateTime.month(.abbreviated).day().hour().minute()))") }
+                if scopeName != "All providers" { cap(scopeName) }
+                HStack(alignment: .top, spacing: fs(22)) {
+                    headline(usd(cur.cost), "Cost", cur.cost, prev.cost, g.days)
+                    headline(tok(cur.tokens), "Tokens", cur.tokens, prev.tokens, g.days)
+                    Spacer(minLength: 0)
+                }
+                if prefs.showInsight {
+                    Text(insight(es, cur, g.days)).font(.system(size: fs(12))).foregroundColor(.primary.opacity(0.85))
+                }
+                if prefs.showDetails {
+                    Text(cur.calls == 0 ? "\(tok(cur.tokens)) tokens"
+                         : "\(tok(cur.tokens)) tokens · \(Int(cur.calls)) calls · \(duration(activeSeconds(es))) active\(remote ? " on this Mac" : "")")
+                        .font(.system(size: fs(10.5))).foregroundColor(.secondary).monospacedDigit()
+                        .help("Active time: 5-minute slots with at least one model call")
+                }
+                if prefs.showTrend { trend(r, g) }
+                if g.codexWindow && prefs.includeOtherDevices && r.codexResetRemote == nil && store.device != thisMac {
+                    Text(store.refreshing ? "Loading usage from other devices…" : "Usage from other devices unavailable")
+                        .font(.system(size: fs(9.5))).foregroundColor(.secondary)
+                } else if !g.codexWindow && prefs.showTrend && prefs.showDetails && remote && g.hourly {
+                    Text("Other devices report daily totals; they appear in the first hour.")
+                        .font(.system(size: fs(9.5))).foregroundColor(.secondary)
+                }
             }
         }
         .card()
@@ -1481,7 +1701,7 @@ struct WidgetView: View {
     /// Breakdown page: what the tokens are made of, and what the cache saved.
     func tokenMix(_ r: Report) -> some View {
         let g = store.span
-        let cur = sum(scoped(r, g.from, g.to))
+        let cur = sum(periodEntries(r, g))
         let inputSide = cur.input + cur.cacheRead + cur.cacheWrite
         return VStack(alignment: .leading, spacing: 8) {
             cap("Token mix · \(g.title) · \(tok(cur.tokens))")
@@ -1499,14 +1719,14 @@ struct WidgetView: View {
     /// Overview page: three numbers about the selected period.
     func totals(_ r: Report) -> some View {
         let g = store.span
-        let es = scoped(r, g.from, g.to)
+        let es = periodEntries(r, g)
         let cur = sum(es)
         let hourly = g.hourly
         let buckets = Dictionary(grouping: es, by: { hourly ? $0.hour : $0.day }).mapValues { sum($0).cost }
         let busiest = buckets.max { $0.value < $1.value }
         return HStack(spacing: 0) {
             if hourly {
-                stat("Active hours", "\(buckets.filter { $0.value > 0 }.count)/\(g.unit == .hour ? 24 : 24)")
+                stat("Active hours", "\(buckets.filter { $0.value > 0 }.count)/\(g.hourCount)")
                 stat("Busiest hour", busiest.map { usd($0.value) } ?? "—", busiest.map { hourLabel($0.key) })
             } else {
                 stat("Active days", "\(buckets.filter { $0.value > 0 }.count)/\(g.days)")
@@ -1556,16 +1776,17 @@ struct WidgetView: View {
 
     /// Bars by hour (Today, 24H, a picked day) or by day; hover for values, click a day to focus it.
     func trend(_ r: Report, _ g: Span) -> some View {
-        let n = g.hourly ? 24 : g.unit == .month ? (cal.dateComponents([.month], from: g.from, to: today()).month ?? 0) + 1 : g.days
+        let first = g.firstBucket
+        let n = g.hourly ? g.hourCount : g.unit == .month ? (cal.dateComponents([.month], from: first, to: today()).month ?? 0) + 1 : g.days
         let start: (Int) -> Date = { i in
-            g.hourly ? g.from.addingTimeInterval(Double(i) * 3600) : cal.date(byAdding: g.unit, value: i, to: g.from)!
+            g.hourly ? first.addingTimeInterval(Double(i) * 3600) : cal.date(byAdding: g.unit, value: i, to: first)!
         }
         var slots = Array(repeating: Row(), count: n)
         var active = Array(repeating: Set<Int>(), count: n)
         var byProvider = Array(repeating: [String: Row](), count: n)
-        for e in scoped(r, g.from, g.to) {
-            let i = g.hourly ? Int(e.hour.timeIntervalSince(g.from) / 3600)
-                : cal.dateComponents([g.unit], from: g.from, to: e.day).value(for: g.unit) ?? -1
+        for e in periodEntries(r, g) {
+            let i = g.hourly ? Int(e.hour.timeIntervalSince(first) / 3600)
+                : cal.dateComponents([g.unit], from: first, to: e.day).value(for: g.unit) ?? -1
             if i >= 0 && i < n {
                 slots[i].add(e.row); active[i].formUnion(e.slots)
                 byProvider[i][e.provider, default: Row()].add(e.row)
@@ -1585,7 +1806,8 @@ struct WidgetView: View {
         let maxV = (0..<n).map(value).max() ?? 0
         let hi = store.hover.flatMap { $0 < n ? $0 : nil }
         let label: (Int) -> String = { i in
-            g.hourly ? hourLabel(start(i)) : g.unit == .month ? start(i).formatted(.dateTime.month(.abbreviated).year(.twoDigits)) : dayLabel(start(i))
+            g.hourly ? hourLabel(i == 0 ? g.from : start(i))
+                : g.unit == .month ? start(i).formatted(.dateTime.month(.abbreviated).year(.twoDigits)) : dayLabel(start(i))
         }
         let peak = (0..<n).max { value($0) < value($1) }
         return VStack(alignment: .leading, spacing: 4) {
@@ -1701,7 +1923,7 @@ struct WidgetView: View {
                             .fixedSize().frame(height: 10)
                         ForEach(0..<7, id: \.self) { d in
                             let day = cal.date(byAdding: .day, value: 7 * w + d, to: start)!
-                            dot(day, daily[day] ?? 0, maxV, day >= g.from && day < g.to)
+                            dot(day, daily[day] ?? 0, maxV, day >= (g.codexWindow ? cal.startOfDay(for: g.from) : g.from) && day < g.to)
                         }
                     }
                     .frame(maxWidth: .infinity)
@@ -1817,7 +2039,7 @@ struct WidgetView: View {
 
     func breakdown(_ r: Report) -> some View {
         let g = store.span
-        let es = scoped(r, g.from, g.to)
+        let es = periodEntries(r, g)
         let cur = sum(es)
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
@@ -1893,7 +2115,7 @@ struct WidgetView: View {
     /// Daily table for the selected range, newest first; click a row to focus that day.
     /// Long ranges list only days with usage.
     func days(_ r: Report, _ g: Span) -> some View {
-        let byDay = Dictionary(grouping: scoped(r, g.from, g.to), by: { $0.day }).mapValues { sum($0) }
+        let byDay = Dictionary(grouping: periodEntries(r, g), by: { $0.day }).mapValues { sum($0) }
         let first = cal.startOfDay(for: g.from), last = cal.startOfDay(for: g.to.addingTimeInterval(-1))
         let count = (cal.dateComponents([.day], from: first, to: last).day ?? 0) + 1
         let rows = (0..<count).map { cal.date(byAdding: .day, value: -$0, to: last)! }
@@ -1951,7 +2173,7 @@ struct WidgetView: View {
                 if store.refreshing {
                     ProgressView().controlSize(.mini).frame(width: fs(14))
                 } else {
-                    Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }.help("Refresh")
+                    Button { store.refresh(forceCodexRefresh: true) } label: { Image(systemName: "arrow.clockwise") }.help("Refresh")
                 }
                 Button { menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) } label: {
                     Image(systemName: "ellipsis.circle")
@@ -2293,7 +2515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count else { return }
         let mode = i + 2 < args.count ? args[i + 2] : "today"
         if mode.hasPrefix("day"), let n = Int(mode.dropFirst(3)) { store.pickedDay = daysAgo(n) }
-        else { store.preset = ["24h": .h24, "week": .week, "month": .month, "90d": .quarter, "all": .all][mode] ?? .today }
+        else { store.preset = ["24h": .h24, "week": .week, "month": .month, "90d": .quarter, "all": .all, "reset": .codexReset][mode] ?? .today }
         let arg: (String) -> String? = { k in args.first { $0.hasPrefix(k + "=") }.map { String($0.dropFirst(k.count + 1)) } }
         if let v = arg("provider") { store.provider = v }
         if let v = arg("model") { store.model = v }
@@ -2376,7 +2598,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return parent
     }
 
-    @objc func refresh() { store.refresh() }
+    @objc func refresh() { store.refresh(forceCodexRefresh: true) }
     @objc func setFormat(_ item: NSMenuItem) { if let v = item.representedObject as? String { prefs.menuBarFormat = v } }
     @objc func setThreshold(_ item: NSMenuItem) { if let v = item.representedObject as? Int { prefs.alertThreshold = v } }
     @objc func toggleWidget() { prefs.showDesktopWidget.toggle() }
