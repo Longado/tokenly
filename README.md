@@ -16,6 +16,8 @@
 - Trend bars by hour, day or month, split by provider; switch between cost, tokens and active time.
 - Live plan limits for Claude and Codex: plan badge, % used, time to reset, reset credits, a warning when you're
   on pace to run out, what 100% of a limit is worth, and what your plan is worth vs its price ("44×").
+- Each plan shows when its reading was taken. If a check fails, that plan shows the cause and uses the newest
+  saved reading with a limit window that is still active.
 
 **Unfolded ("Show all")**
 - Breakdown by provider, model, project, device or day; click any row to filter the whole panel.
@@ -96,6 +98,10 @@ itself in `~/Library/Application Support/Tokenly/`.
 
 `$CLAUDE_CONFIG_DIR` and `$CODEX_HOME` are respected.
 
+The macOS app also reads Codex's archived sessions and uses `zstd` on `.jsonl.zst` logs when available.
+Monthly usage keeps tokens for models without prices and marks the API cost estimate as incomplete.
+Plan weeks use saved limit readings, even when a current limit cannot be refreshed.
+
 ## Development
 
 ```bash
@@ -107,6 +113,15 @@ TOKENLY_DEMO=1 macos/build/Tokenly.app/Contents/MacOS/Tokenly --snapshot out.png
 `--snapshot out.png [today|24h|week|month|90d|all|custom from=… to=…|dayN] [--popover|--settings] [page=all]
 [--tall] [provider=…] [model=…] [project=…] [device=…] [mode=…] [hover=N]` renders the panel to a PNG;
 `TOKENLY_DEMO=1` uses made-up data.
+
+Run the macOS history regression test with `zstd` installed.
+
+```bash
+tokenly_test_dir=$(mktemp -d)
+swiftc -D TOKENLY_HISTORY_TESTS macos/main.swift tests/macos_history.swift -o "$tokenly_test_dir/history-test"
+CFFIXED_USER_HOME="$tokenly_test_dir" CODEX_HOME="$tokenly_test_dir/codex" \
+  CLAUDE_CONFIG_DIR="$tokenly_test_dir/claude" "$tokenly_test_dir/history-test"
+```
 
 ## License
 
