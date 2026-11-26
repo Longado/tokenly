@@ -173,6 +173,8 @@ struct Report {
     var quotas: [Quota] = []
     var updated = Date()
     var otherDevicesStatus = "" // why other devices are missing, when the import is on
+    var codexHistoryStatus = ""
+    var loadingCodexHistory = false
     var quotaReadErrors: [String: String] = [:]
     var readings: [QuotaReading] = []
     var codexResetStart: Date?
@@ -292,7 +294,8 @@ func limitStart(_ meter: QuotaMeter, product: String, asOf: Date, readings: [Quo
 
 /// One past or current 7-day window of a plan.
 struct PlanWeek: Identifiable {
-    let start: Date, end: Date, cost: Double, resets: Int, peak: Double?
+    let start: Date, end: Date, cost: Double?, resets: Int, peak: Double?
+    let hasUnpricedUsage: Bool
     let perFull: Double?   // what 100% was worth this week, when readings allow
     var id: Date { start }
 }
@@ -304,23 +307,31 @@ func planWeeks(_ r: Report, _ product: String, weeks: Int = 8) -> [PlanWeek] {
     guard let anchor = rs.filter({ $0.resetsAt != nil }).max(by: { $0.at < $1.at })?.resetsAt else { return [] }
     let resets = limitResets(rs), now = Date(), week: TimeInterval = 7 * 86400
     let reportedEnds = Set(rs.compactMap(\.resetsAt)).sorted()
+    let productEntries = r.entries.filter { $0.tool.localizedCaseInsensitiveContains(product) }
     var end = anchor, scheduledEnd = anchor
     var result: [PlanWeek] = []
     for _ in 0..<weeks {
         let start = scheduledEnd.addingTimeInterval(-week)
-        let cost = productCost(r.entries, product, from: start, to: min(end, now))
+        let until = min(end, now)
+        let entries = productEntries.filter { entry in
+            if entry.device == thisMac { return entry.clippedHour(from: start, to: until) != nil }
+            let dayEnd = cal.date(byAdding: .day, value: 1, to: entry.day)!
+            return max(start, entry.day) < min(until, dayEnd)
+        }
+        let cost = entries.isEmpty ? nil : productCost(entries, product, from: start, to: until)
+        let hasUnpricedUsage = entries.contains { $0.device == thisMac && r.unpriced.contains($0.model) }
         let inWeek = rs.filter { $0.at >= start && $0.at < end }
         let weekResets = resets.filter { $0.at >= start && $0.at < end }.map(\.at)
         // 100% value: in the stretch since the last reset before a reading, cost ÷ % at that reading.
         var perFull: Double?
-        if let best = inWeek.filter({ $0.percent >= 5 }).max(by: { $0.percent < $1.percent }) {
+        if !hasUnpricedUsage, let best = inWeek.filter({ $0.percent >= 5 }).max(by: { $0.percent < $1.percent }) {
             let segStart = max(start, weekResets.filter { $0 <= best.at }.max() ?? start)
-            let c = productCost(r.entries, product, from: segStart, to: best.at)
+            let c = productCost(entries, product, from: segStart, to: best.at)
             if c > 0 { perFull = c / best.percent * 100 }
         }
-        if cost > 0 || !weekResets.isEmpty {
+        if cost != nil || !inWeek.isEmpty || !weekResets.isEmpty {
             result.append(PlanWeek(start: start, end: end, cost: cost, resets: weekResets.count,
-                                   peak: inWeek.map { $0.percent }.max(), perFull: perFull))
+                                   peak: inWeek.map { $0.percent }.max(), hasUnpricedUsage: hasUnpricedUsage, perFull: perFull))
         }
         if let previousEnd = resets.last(where: { $0.at == start && $0.previousEnd != nil })?.previousEnd {
             end = start
@@ -525,6 +536,7 @@ final class Scanner {
     private var files: [String: FileState] = [:]
     private var seenClaude = Set<String>()
     private var prices: [String: [Double]] = [:]
+    private var codexHistoryStatus = ""
     private let env = ProcessInfo.processInfo.environment
     private let vibe = VibeImporter()
     private let codexLive = CodexLive()
@@ -579,12 +591,12 @@ final class Scanner {
         st.buckets[key]!.usageByTime[date, default: Row()].add(r)
     }
 
-    /// .jsonl files under `dir` modified since `since`.
-    func jsonl(under dir: String, since: Date) -> [String] {
+    /// Session files modified since the start of the scan window.
+    func jsonl(under dir: String, since: Date, compressed: Bool = false) -> [String] {
         let url = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
         guard let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
         var out: [String] = []
-        for case let f as URL in e where f.pathExtension == "jsonl" {
+        for case let f as URL in e where f.pathExtension == "jsonl" || (compressed && f.lastPathComponent.hasSuffix(".jsonl.zst")) {
             let mod = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
             if let mod = mod, mod < since { continue }
             out.append(f.path)
@@ -592,32 +604,67 @@ final class Scanner {
         return out
     }
 
-    /// Feeds each complete line appended to `path` since the last scan to `body`.
-    func scan(_ path: String, _ body: (FileState, Substring) -> Void) {
+    /// Plain logs are incremental. Compressed rollouts are read once per file revision.
+    @discardableResult
+    func scan(_ path: String, decoder: String? = nil, matching markers: [Data], _ body: (FileState, Substring) -> Void) -> Bool {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
               let size = (attrs[.size] as? NSNumber)?.uint64Value,
-              let mtime = attrs[.modificationDate] as? Date else { return }
-        var st = files[path] ?? FileState()
-        if size < st.offset { st = FileState() } // truncated or rewritten
-        files[path] = st
-        if size == st.size && mtime == st.mtime { return }
-        guard let h = FileHandle(forReadingAtPath: path) else { return }
-        defer { try? h.close() }
-        h.seek(toFileOffset: st.offset)
-        var carry = Data()
-        while true {
-            let chunk: Data = autoreleasepool { h.readData(ofLength: 1 << 20) }
-            if chunk.isEmpty { break }
-            carry.append(chunk)
-            guard let nl = carry.lastIndex(of: 0x0A) else { continue } // a line longer than one chunk
-            let complete = carry[carry.startIndex...nl]
-            autoreleasepool {
-                for line in String(decoding: complete, as: UTF8.self).split(separator: "\n") { body(st, line) }
-            }
-            st.offset += UInt64(complete.count)
-            carry = Data(carry[carry.index(after: nl)...])
+              let mtime = attrs[.modificationDate] as? Date else { return false }
+        let previous = files[path]
+        if let previous, size == previous.size && mtime == previous.mtime { return true }
+        var st = FileState()
+        let h: FileHandle
+        var process: Process?
+        var decoderFinished: DispatchSemaphore?
+        if let decoder {
+            let decoderProcess = Process(), output = Pipe()
+            let finished = DispatchSemaphore(value: 0)
+            decoderProcess.executableURL = URL(fileURLWithPath: decoder)
+            decoderProcess.arguments = ["-qdc", "--", path]
+            decoderProcess.standardOutput = output
+            decoderProcess.standardError = FileHandle.nullDevice
+            decoderProcess.terminationHandler = { _ in finished.signal() }
+            do { try decoderProcess.run() } catch { return false }
+            process = decoderProcess
+            decoderFinished = finished
+            h = output.fileHandleForReading
+        } else {
+            guard let file = FileHandle(forReadingAtPath: path) else { return false }
+            h = file
+            if let previous, previous.offset <= size { st = previous }
+            h.seek(toFileOffset: st.offset)
         }
-        st.size = size; st.mtime = mtime
+        defer {
+            try? h.close()
+            if let process, process.isRunning { process.terminate(); decoderFinished?.wait() }
+        }
+
+        func consume(_ data: Data) {
+            for line in data.split(separator: 0x0A) where markers.contains(where: { line.range(of: $0) != nil }) {
+                body(st, String(decoding: line, as: UTF8.self)[...])
+            }
+        }
+
+        var carry = Data()
+        do {
+            while let chunk = try autoreleasepool(invoking: { try h.read(upToCount: 1 << 20) }), !chunk.isEmpty {
+                carry.append(chunk)
+                guard let nl = carry.lastIndex(of: 0x0A) else { continue }
+                let complete = carry[carry.startIndex...nl]
+                autoreleasepool { consume(complete) }
+                st.offset += UInt64(complete.count)
+                carry = Data(carry[carry.index(after: nl)...])
+            }
+        } catch { return false }
+        if let process, let decoderFinished {
+            decoderFinished.wait()
+            guard process.terminationStatus == 0 else { return false }
+            autoreleasepool { consume(carry) }
+        }
+        st.size = size
+        st.mtime = mtime
+        files[path] = st
+        return true
     }
 
     func json(_ line: Substring) -> [String: Any]? {
@@ -626,9 +673,10 @@ final class Scanner {
 
     func scanClaude(_ root: String, since: Date) -> [String] {
         let paths = jsonl(under: root + "/projects", since: since)
+        let markers = [Data("\"usage\"".utf8)]
         for path in paths {
-            scan(path) { st, line in
-                guard line.contains("\"usage\""), let d = json(line), let m = d["message"] as? [String: Any],
+            scan(path, matching: markers) { st, line in
+                guard let d = json(line), let m = d["message"] as? [String: Any],
                       let u = m["usage"] as? [String: Any], let date = parseDate(d["timestamp"]) else { return }
                 // the same message can be logged several times, also across session files
                 if !seenClaude.insert("\(m["id"] ?? "")|\(d["requestId"] ?? "")").inserted { return }
@@ -643,12 +691,29 @@ final class Scanner {
         return paths
     }
 
-    func scanCodex(_ root: String, since: Date) -> [String] {
-        let paths = jsonl(under: root + "/sessions", since: since)
+    func scanCodex(_ root: String, since: Date, beforeBackfill: () -> Void) -> [String] {
+        let logs = ["sessions", "archived_sessions"].flatMap { jsonl(under: root + "/" + $0, since: since, compressed: true).sorted() }
+        let plain = logs.filter { !$0.hasSuffix(".zst") }, compressed = logs.filter { $0.hasSuffix(".zst") }
+        var seen = Set<String>()
+        // The same rollout can be present in both folders or both formats during archiving.
+        let paths = (plain + compressed).filter { path in
+            let name = (path as NSString).lastPathComponent
+            return seen.insert(name.hasSuffix(".zst") ? String(name.dropLast(4)) : name).inserted
+        }
+        let decoderPaths = ["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd"]
+            + (env["PATH"] ?? "").split(separator: ":").map { "\($0)/zstd" }
+        let decoder = decoderPaths.first(where: FileManager.default.isExecutableFile(atPath:))
+        let markers = [Data("\"turn_context\"".utf8), Data("\"token_count\"".utf8)]
+        var needsDecoder = false, unreadable = false, startedBackfill = false
         for path in paths {
-            scan(path) { st, line in
-                guard line.contains("turn_context") || line.contains("token_count"),
-                      let d = json(line), let p = d["payload"] as? [String: Any] else { return }
+            let isCompressed = path.hasSuffix(".zst")
+            if isCompressed && decoder == nil { needsDecoder = true; continue }
+            if isCompressed && files[path] == nil && !startedBackfill {
+                beforeBackfill()
+                startedBackfill = true
+            }
+            let read = scan(path, decoder: isCompressed ? decoder : nil, matching: markers) { st, line in
+                guard let d = json(line), let p = d["payload"] as? [String: Any] else { return }
                 if d["type"] as? String == "turn_context" {
                     if let m = p["model"] as? String { st.model = m }
                     if let c = p["cwd"] as? String { st.project = (c as NSString).lastPathComponent }
@@ -673,6 +738,12 @@ final class Scanner {
                     }
                 }
             }
+            if !read { unreadable = true }
+        }
+        if needsDecoder {
+            codexHistoryStatus = "Install zstd to read compressed Codex logs"
+        } else {
+            codexHistoryStatus = unreadable ? "Some Codex logs could not be read" : ""
         }
         return paths
     }
@@ -748,13 +819,7 @@ final class Scanner {
         return Quota(product: "Claude", plan: nil, meters: meters, asOf: asOf, source: "Claude Code on this Mac")
     }
 
-    func run(otherDevices: Bool = false, forceCodexRefresh: Bool = false, includeCodexReset: Bool = false) -> Report {
-        let p = loadPrices()
-        if p != prices { prices = p; files = [:]; seenClaude = [] } // costs are computed while parsing
-        let since = daysAgo(scanDays - 1)
-        let alive = Set(scanClaude(env["CLAUDE_CONFIG_DIR"] ?? "~/.claude", since: since)
-                        + scanCodex(env["CODEX_HOME"] ?? "~/.codex", since: since))
-        files = files.filter { alive.contains($0.key) } // forget files that aged out
+    private func localReport(since: Date) -> Report {
         var merged: [String: Entry] = [:]
         var unpriced = Set<String>()
         for st in files.values {
@@ -767,9 +832,27 @@ final class Scanner {
                 }
             }
         }
+        return Report(entries: Array(merged.values), unpriced: unpriced)
+    }
+
+    func run(otherDevices: Bool = false, forceCodexRefresh: Bool = false, includeCodexReset: Bool = false,
+             publishBeforeBackfill: ((Report) -> Void)? = nil) -> Report {
+        let p = loadPrices()
+        if p != prices { prices = p; files = [:]; seenClaude = [] } // costs are computed while parsing
+        let since = daysAgo(scanDays - 1)
+        let claudePaths = scanClaude(env["CLAUDE_CONFIG_DIR"] ?? "~/.claude", since: since)
+        let codexPaths = scanCodex(env["CODEX_HOME"] ?? "~/.codex", since: since) {
+            guard let publishBeforeBackfill else { return }
+            var partial = localReport(since: since)
+            partial.loadingCodexHistory = true
+            publishBeforeBackfill(partial)
+        }
+        let alive = Set(claudePaths + codexPaths)
+        files = files.filter { alive.contains($0.key) } // forget files that aged out
         let codex = codexQuota(forceRefresh: forceCodexRefresh)
-        var report = Report(entries: Array(merged.values), unpriced: unpriced,
-                            quotas: [claudeQuota(), codex].compactMap { $0 })
+        var report = localReport(since: since)
+        report.quotas = [claudeQuota(), codex].compactMap { $0 }
+        report.codexHistoryStatus = codexHistoryStatus
         if liveClaude && !claudeLive.status.isEmpty { report.quotaReadErrors["Claude"] = claudeLive.status }
         if liveCodex && !codexLive.status.isEmpty { report.quotaReadErrors["Codex"] = codexLive.status }
         if otherDevices {
@@ -1091,6 +1174,11 @@ private let groupedInt: NumberFormatter = {
     return f
 }()
 func usd(_ v: Double) -> String { v >= 1000 ? "$" + (groupedInt.string(from: NSNumber(value: v)) ?? "\(Int(v))") : String(format: "$%.2f", v) }
+func historyCost(_ value: Double?, partial: Bool) -> String {
+    guard let value else { return "—" }
+    if partial { return value > 0 ? "≥ \(usd(value))" : "—" }
+    return usd(value)
+}
 func tok(_ v: Double) -> String {
     v >= 1e9 ? String(format: "%.1fB", v / 1e9) : v >= 1e6 ? String(format: "%.1fM", v / 1e6)
         : v >= 1e3 ? String(format: "%.0fK", v / 1e3) : String(format: "%.0f", v)
@@ -1261,12 +1349,18 @@ final class Store: ObservableObject {
     func refresh(forceCodexRefresh: Bool = false) {
         refreshing = true
         let includeCodexReset = preset == .codexReset
+        let initial = report == nil
         queue.async {
             self.scanner.liveCodex = Prefs.shared.liveCodex
             self.scanner.liveClaude = Prefs.shared.liveClaude
+            let publishBeforeBackfill: ((Report) -> Void)? = initial ? { partial in
+                DispatchQueue.main.async {
+                    if self.report == nil { self.report = partial }
+                }
+            } : nil
             let r = ProcessInfo.processInfo.environment["TOKENLY_DEMO"] != nil ? Report.demo()
                 : self.scanner.run(otherDevices: Prefs.shared.includeOtherDevices, forceCodexRefresh: forceCodexRefresh,
-                                   includeCodexReset: includeCodexReset)
+                                   includeCodexReset: includeCodexReset, publishBeforeBackfill: publishBeforeBackfill)
             DispatchQueue.main.async { self.report = r; self.refreshing = false; self.onUpdate?(r) }
         }
     }
@@ -1997,9 +2091,10 @@ struct WidgetView: View {
 
     /// Plan usage by week: cost, full limits used (cost ÷ that week's 100% value) and detected resets.
     func planHistory(_ r: Report) -> some View {
-        let products = r.quotas.map { $0.product }.filter { !planWeeks(r, $0, weeks: 1).isEmpty }
+        let history = Dictionary(uniqueKeysWithValues: ["Claude", "Codex"].map { ($0, planWeeks(r, $0)) })
+        let products = ["Claude", "Codex"].filter { history[$0]?.isEmpty == false }
         let product = products.contains(store.planProduct) ? store.planProduct : products.first ?? ""
-        let weeks = planWeeks(r, product)
+        let weeks = history[product] ?? []
         let latestFull = weeks.compactMap { $0.perFull }.first
         let firstReading = r.readings.filter { $0.product == product }.map { $0.at }.min()
         return Group {
@@ -2012,17 +2107,19 @@ struct WidgetView: View {
                     }
                     HStack {
                         cap("Week"); Spacer()
-                        cap("Cost").frame(width: fs(64), alignment: .trailing)
+                        cap("API est.").frame(width: fs(74), alignment: .trailing)
                         cap("Limits").frame(width: fs(52), alignment: .trailing)
                         cap("Resets").frame(width: fs(48), alignment: .trailing)
                     }
                     ForEach(weeks) { w in
-                        let full = w.perFull ?? latestFull
+                        let full = w.hasUnpricedUsage ? nil : (w.perFull ?? latestFull)
+                        let limitUse = full.flatMap { full in w.cost.map { $0 / full } }
                         HStack {
                             Text("\(dayLabel(w.start)) – \(dayLabel(w.end))\(w.end > Date() ? " ·" : "")")
                             Spacer()
-                            Text(usd(w.cost)).frame(width: fs(64), alignment: .trailing)
-                            Text(full.map { "\(w.perFull == nil ? "≈" : "")\(String(format: "%.1f×", w.cost / $0))" } ?? "—")
+                            Text(historyCost(w.cost, partial: w.hasUnpricedUsage)).frame(width: fs(74), alignment: .trailing)
+                                .help(w.hasUnpricedUsage ? "Some models in this week have no price" : "API list-price estimate from available logs")
+                            Text(limitUse.map { "\(w.perFull == nil ? "≈" : "")\(String(format: "%.1f×", $0))" } ?? "—")
                                 .frame(width: fs(52), alignment: .trailing)
                                 .foregroundColor(w.perFull == nil ? .secondary : .primary)
                                 .help(w.perFull.map { "100% was worth ≈ \(usd($0)) this week" } ?? "No readings this week; uses the latest known 100% value")
@@ -2039,32 +2136,50 @@ struct WidgetView: View {
         }
     }
 
-    /// History page: every month on record, newest first.
+    /// History page: each month in the available logs, newest first.
     func monthly(_ r: Report) -> some View {
         let first = cal.dateInterval(of: .month, for: r.firstDay ?? today())!.start
         let all = Span(from: first, to: tomorrow(), days: 1, title: "All time", unit: .month)
         let es = scoped(r, all.from, all.to)
-        let byMonth = Dictionary(grouping: es, by: { cal.dateInterval(of: .month, for: $0.day)!.start }).mapValues { sum($0) }
+        let byMonth = Dictionary(grouping: es, by: { cal.dateInterval(of: .month, for: $0.day)!.start })
         let months = byMonth.keys.sorted(by: >)
         let total = sum(es)
+        let partialTotal = es.contains { $0.device == thisMac && r.unpriced.contains($0.model) }
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
-                cap("All time · \(scopeName)")
+                cap("Monthly usage")
+                    .help("Available logs for \(scopeName). Local history includes the last \(scanDays) days.")
                 Spacer()
-                cap("\(usd(total.cost)) · \(tok(total.tokens))")
+                if !es.isEmpty {
+                    cap("\(tok(total.tokens)) tokens")
+                    cap("API est. \(historyCost(total.cost, partial: partialTotal))")
+                        .help(partialTotal ? "Models without prices are included in tokens but excluded from cost" : "API list-price estimate")
+                }
             }
-            trend(r, all)
-            Divider().opacity(0.6)
-            VStack(spacing: 0) {
-                ForEach(months, id: \.self) { m in
-                    HStack {
-                        Text(m.formatted(.dateTime.month(.wide).year()))
-                        Spacer()
-                        Text(tok(byMonth[m]!.tokens)).foregroundColor(.secondary).frame(width: fs(70), alignment: .trailing)
-                        Text(usd(byMonth[m]!.cost)).frame(width: fs(74), alignment: .trailing)
+            if !r.codexHistoryStatus.isEmpty {
+                Label(r.codexHistoryStatus, systemImage: "exclamationmark.triangle")
+                    .font(.system(size: fs(10))).foregroundColor(.orange)
+            }
+            if months.isEmpty && !r.loadingCodexHistory {
+                Text("No saved usage for this selection").font(.system(size: fs(11))).foregroundColor(.secondary)
+            } else if !months.isEmpty {
+                trend(r, all)
+                Divider().opacity(0.6)
+                VStack(spacing: 0) {
+                    ForEach(months, id: \.self) { m in
+                        let entries = byMonth[m] ?? []
+                        let row = sum(entries)
+                        let partial = entries.contains { $0.device == thisMac && r.unpriced.contains($0.model) }
+                        HStack {
+                            Text(m.formatted(.dateTime.month(.wide).year()))
+                            Spacer()
+                            Text(tok(row.tokens)).foregroundColor(.secondary).frame(width: fs(70), alignment: .trailing)
+                            Text(historyCost(row.cost, partial: partial)).frame(width: fs(87), alignment: .trailing)
+                                .help(partial ? "Models without prices are included in tokens but excluded from cost" : "API list-price estimate")
+                        }
+                        .font(.system(size: fs(11.5))).monospacedDigit().padding(.vertical, 4)
+                        Divider().opacity(0.4)
                     }
-                    .font(.system(size: fs(11.5))).monospacedDigit().padding(.vertical, 4)
-                    Divider().opacity(0.4)
                 }
             }
         }
@@ -2214,7 +2329,9 @@ struct WidgetView: View {
     var footer: some View {
         HStack(spacing: 6) {
             if let r = store.report {
-                if !r.otherDevicesStatus.isEmpty {
+                if r.loadingCodexHistory {
+                    Text("Reading compressed Codex history…").lineLimit(1)
+                } else if !r.otherDevicesStatus.isEmpty {
                     Label(r.otherDevicesStatus, systemImage: "exclamationmark.triangle").foregroundColor(.orange).lineLimit(1)
                         .help(r.otherDevicesStatus)
                 } else {
@@ -2717,6 +2834,9 @@ func migrateFromTokenMeter() {
     ud.set(true, forKey: "migratedFromTokenMeter")
 }
 
+#if TOKENLY_HISTORY_TESTS
+try testUsageHistory()
+#else
 makeIconsetIfRequested()
 signal(SIGPIPE, SIG_IGN) // a probe that exits early must not take the app down with it
 migrateFromTokenMeter()
@@ -2725,3 +2845,4 @@ let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()
+#endif
