@@ -16,6 +16,8 @@
 - Trend bars by hour, day or month, split by provider; switch between cost, tokens and active time.
 - Live plan limits for Claude and Codex: plan badge, % used, time to reset, reset credits, a warning when you're
   on pace to run out, what 100% of a limit is worth, and what your plan is worth vs its price ("44×").
+- Each plan shows when its reading was taken. If a check fails, that plan shows the cause and uses the newest
+  saved reading with a limit window that is still active.
 
 **Unfolded ("Show all")**
 - Breakdown by provider, model, project, device or day; click any row to filter the whole panel.

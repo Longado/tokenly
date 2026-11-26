@@ -147,11 +147,24 @@ struct QuotaMeter: Identifiable {
 
 /// Subscription usage as last recorded locally by the tool itself.
 struct Quota: Identifiable {
-    let product: String, plan: String?, meters: [QuotaMeter], asOf: Date?
+    let product: String, plan: String?
+    var meters: [QuotaMeter]
+    let asOf: Date?
     var source = "" // where the reading came from, shown in the card
     var resetCredits: Int? = nil
     var id: String { product }
     var peak: Double { meters.map { $0.percent }.max() ?? 0 }
+
+    func active(at now: Date = Date()) -> Quota? {
+        var reading = self
+        reading.meters = meters.filter { ($0.resetsAt ?? .distantFuture) > now }
+        return reading.meters.isEmpty ? nil : reading
+    }
+
+    static func newestActive(_ readings: Quota?...) -> Quota? {
+        let now = Date()
+        return readings.compactMap { $0?.active(at: now) }.max { ($0.asOf ?? .distantPast) < ($1.asOf ?? .distantPast) }
+    }
 }
 
 struct Report {
@@ -160,7 +173,7 @@ struct Report {
     var quotas: [Quota] = []
     var updated = Date()
     var otherDevicesStatus = "" // why other devices are missing, when the import is on
-    var liveStatus = "" // why the live Codex read failed, when it did
+    var quotaReadErrors: [String: String] = [:]
     var readings: [QuotaReading] = []
     var codexResetStart: Date?
     var codexResetRemote: [Entry]? // requested from the reset instant, already clipped by Vibe Usage
@@ -519,7 +532,6 @@ final class Scanner {
     var liveClaude = true
     private let readingStore = ReadingStore()
     var liveCodex = true
-    var liveStatus: String { [liveCodex ? codexLive.status : "", liveClaude ? claudeLive.status : ""].first { !$0.isEmpty } ?? "" }
 
     /// Other devices' buckets, priced with our table when we know the model.
     func remoteEntries(_ buckets: [VibeImporter.Bucket], excluding host: String?, useBucketTime: Bool = false) -> [Entry] {
@@ -689,15 +701,18 @@ final class Scanner {
         }
         if meters.isEmpty { return nil }
         return Quota(product: "Codex", plan: d["planLabel"] as? String, meters: meters, asOf: at,
-                     source: "live via Vibe Usage", resetCredits: (d["resetCreditsCount"] as? NSNumber)?.intValue)
+                     source: "Vibe Usage cache", resetCredits: (d["resetCreditsCount"] as? NSNumber)?.intValue)
     }
 
-    /// Codex: live when available, otherwise the newer of Vibe Usage's cached reading and Codex's logs.
+    /// Codex: prefer a successful direct read, then the newest usable saved reading.
     func codexQuota(forceRefresh: Bool) -> Quota? {
-        if liveCodex, let live = codexLive.quota(forceRefresh: forceRefresh) { return live }
-        let vibeLive = vibeCodexQuota()
-        guard let (at, rl) = files.values.compactMap({ $0.rateLimits }).max(by: { $0.at < $1.at }) else { return vibeLive }
-        if let v = vibeLive, let vAt = v.asOf, vAt > at { return v }
+        let direct = liveCodex ? codexLive.quota(forceRefresh: forceRefresh) : nil
+        if codexLive.status.isEmpty, let live = direct?.active() { return live }
+        return Quota.newestActive(direct, vibeCodexQuota(), codexLogQuota())
+    }
+
+    private func codexLogQuota() -> Quota? {
+        guard let (at, rl) = files.values.compactMap({ $0.rateLimits }).max(by: { $0.at < $1.at }) else { return nil }
         let meters = ["primary", "secondary"].compactMap { k -> QuotaMeter? in
             guard let w = rl[k] as? [String: Any] else { return nil }
             let reset = (w["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
@@ -710,10 +725,18 @@ final class Scanner {
                      source: "Codex logs on this Mac")
     }
 
-    /// Claude: live from Claude Code when enabled, else the utilization it caches in ~/.claude.json.
-    /// Windows that already reset are dropped.
+    /// Claude: prefer a successful direct read, then the newest usable saved reading.
     func claudeQuota() -> Quota? {
-        if liveClaude, let live = claudeLive.quota() { return live }
+        guard liveClaude else { return cachedClaudeQuota() }
+        let direct = claudeLive.quota()
+        if claudeLive.status.isEmpty {
+            if direct == nil { return nil } // Claude Code confirmed this login has no subscription limits.
+            if let live = direct?.active() { return live }
+        }
+        return Quota.newestActive(direct, cachedClaudeQuota())
+    }
+
+    private func cachedClaudeQuota() -> Quota? {
         let dir = env["CLAUDE_CONFIG_DIR"] ?? NSHomeDirectory()
         guard let data = FileManager.default.contents(atPath: dir + "/.claude.json"),
               let d = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -747,6 +770,8 @@ final class Scanner {
         let codex = codexQuota(forceRefresh: forceCodexRefresh)
         var report = Report(entries: Array(merged.values), unpriced: unpriced,
                             quotas: [claudeQuota(), codex].compactMap { $0 })
+        if liveClaude && !claudeLive.status.isEmpty { report.quotaReadErrors["Claude"] = claudeLive.status }
+        if liveCodex && !codexLive.status.isEmpty { report.quotaReadErrors["Codex"] = codexLive.status }
         if otherDevices {
             let (buckets, host) = vibe.buckets()
             report.entries += remoteEntries(buckets, excluding: host)
@@ -896,6 +921,7 @@ final class VibeImporter {
 final class CodexLive {
     private(set) var status = ""
     private var last: Quota?
+    private var accountID: String?
     private var lastAttempt = Date.distantPast
     private let minInterval: TimeInterval = 120
 
@@ -915,28 +941,49 @@ final class CodexLive {
     }
 
     func quota(forceRefresh: Bool = false) -> Quota? {
-        if !forceRefresh && Date().timeIntervalSince(lastAttempt) < minInterval { return status.isEmpty ? last : nil }
+        if !forceRefresh && Date().timeIntervalSince(lastAttempt) < minInterval { return last }
         lastAttempt = Date()
         guard let data = FileManager.default.contents(atPath: home + "/auth.json"),
               let auth = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let tokens = auth["tokens"] as? [String: Any],
               let token = tokens["access_token"] as? String, !token.isEmpty else {
-            status = "Not signed in to Codex with ChatGPT"; return nil
+            status = "Sign in to Codex with ChatGPT to read limits"
+            last = nil
+            return nil
         }
+        let account = tokens["account_id"] as? String
+        if accountID != account { last = nil; accountID = account }
         var req = URLRequest(url: endpoint(), timeoutInterval: 10)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("Tokenly", forHTTPHeaderField: "User-Agent")
-        if let account = tokens["account_id"] as? String, !account.isEmpty { req.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id") }
+        if let account, !account.isEmpty { req.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id") }
         let done = DispatchSemaphore(value: 0)
         var body: Data?, code = 0
-        URLSession.shared.dataTask(with: req) { d, resp, _ in
-            body = d; code = (resp as? HTTPURLResponse)?.statusCode ?? 0; done.signal()
+        var networkError: URLError.Code?
+        URLSession.shared.dataTask(with: req) { d, resp, error in
+            body = d
+            code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            networkError = (error as? URLError)?.code
+            done.signal()
         }.resume()
         done.wait()
         guard code == 200, let body = body, let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
-            status = code == 401 || code == 403 ? "Codex login expired — open Codex to sign in again" : "Live Codex read failed (\(code == 0 ? "offline" : "HTTP \(code)"))"
-            return nil
+            if code == 401 || code == 403 {
+                status = "Open Codex to sign in again"
+                last = nil
+            } else if networkError == .cannotFindHost || networkError == .dnsLookupFailed {
+                status = "Codex server name lookup failed (DNS)"
+            } else if networkError == .timedOut {
+                status = "Codex limit check timed out"
+            } else {
+                switch code {
+                case 0: status = "Couldn't reach Codex"
+                case 200: status = "Couldn't read Codex limits"
+                default: status = "Codex limit check failed (HTTP \(code))"
+                }
+            }
+            return last
         }
         let now = Date()
         let rl = obj["rate_limit"] as? [String: Any] ?? [:]
@@ -950,9 +997,10 @@ final class CodexLive {
                               resetsAt: reset, window: secs.doubleValue)
         }.sorted { $0.window ?? 0 < $1.window ?? 0 }
         let credits = ((obj["rate_limit_reset_credits"] as? [String: Any])?["available_count"] as? NSNumber)?.intValue
+        guard !meters.isEmpty else { status = "Codex returned no limits"; return last }
         status = ""
-        last = meters.isEmpty ? nil : Quota(product: "Codex", plan: (obj["plan_type"] as? String)?.capitalized, meters: meters,
-                                            asOf: now, source: "live", resetCredits: credits)
+        last = Quota(product: "Codex", plan: (obj["plan_type"] as? String)?.capitalized, meters: meters,
+                     asOf: now, source: "live", resetCredits: credits)
         return last
     }
 }
@@ -1216,10 +1264,9 @@ final class Store: ObservableObject {
         queue.async {
             self.scanner.liveCodex = Prefs.shared.liveCodex
             self.scanner.liveClaude = Prefs.shared.liveClaude
-            var r = ProcessInfo.processInfo.environment["TOKENLY_DEMO"] != nil ? Report.demo()
+            let r = ProcessInfo.processInfo.environment["TOKENLY_DEMO"] != nil ? Report.demo()
                 : self.scanner.run(otherDevices: Prefs.shared.includeOtherDevices, forceCodexRefresh: forceCodexRefresh,
                                    includeCodexReset: includeCodexReset)
-            r.liveStatus = self.scanner.liveStatus
             DispatchQueue.main.async { self.report = r; self.refreshing = false; self.onUpdate?(r) }
         }
     }
@@ -1361,7 +1408,7 @@ struct WidgetView: View {
             } else if let r = store.report {
                 controls(r)
                 hero(r)
-                if prefs.showLimits && !r.quotas.isEmpty { quotas(r) }
+                if prefs.showLimits && (!r.quotas.isEmpty || !r.quotaReadErrors.isEmpty) { quotas(r) }
                 if prefs.showPeriodStats { totals(r) }
                 if prefs.expanded {
                     section("Breakdown")
@@ -1597,10 +1644,12 @@ struct WidgetView: View {
                             Text("↻ \(c) reset\(c == 1 ? "" : "s") left").font(.system(size: fs(9.5))).foregroundColor(.secondary)
                                 .help("Banked resets available in Codex")
                         }
-                        if prefs.showLimitDetails, let at = q.asOf, Date().timeIntervalSince(at) > 3600 {
-                            Text("as of \(relative(at))").font(.system(size: fs(9.5))).foregroundColor(.secondary)
-                        }
+                        let readingLabel = q.source == "live" && r.quotaReadErrors[q.product] == nil ? "Read" : "Saved"
+                        Text(q.asOf.map { "\(readingLabel) \(relative($0))" } ?? "Saved reading")
+                            .font(.system(size: fs(9.5))).foregroundColor(.secondary)
+                            .help(q.asOf.map { "\(q.source), \($0.formatted(date: .abbreviated, time: .shortened))" } ?? q.source)
                     }
+                    if let issue = r.quotaReadErrors[q.product] { quotaReadIssue(issue) }
                     planValue(r, q)
                     ForEach(q.meters) { m in
                         VStack(spacing: 4) {
@@ -1622,7 +1671,7 @@ struct WidgetView: View {
                                         Text("\(Int(rec.rounded()))% \(relative(at)) + usage since")
                                             .help("Last reading: \(Int(rec.rounded()))% \(relative(at)) (\(q.source)). The rest is estimated from usage on all devices since then, so it can be off by a few points.")
                                     } else {
-                                        Text("\(usd(m.spent ?? perFull * m.percent / 100)) used · \(q.source)").lineLimit(1)
+                                        Text("\(usd(m.spent ?? perFull * m.percent / 100)) used").lineLimit(1)
                                     }
                                     Spacer()
                                     Text("100% ≈ \(usd(perFull))").fontWeight(.semibold).foregroundColor(.primary)
@@ -1652,8 +1701,20 @@ struct WidgetView: View {
                     }
                 }
             }
+            ForEach(r.quotaReadErrors.keys.sorted().filter { product in !r.quotas.contains { $0.product == product } }, id: \.self) { product in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(product).font(.system(size: fs(12), weight: .medium))
+                    if let issue = r.quotaReadErrors[product] { quotaReadIssue(issue) }
+                }
+            }
         }
         .card()
+    }
+
+    private func quotaReadIssue(_ issue: String) -> some View {
+        Label(issue, systemImage: "exclamationmark.triangle")
+            .font(.system(size: fs(10))).foregroundColor(.orange)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: hero
@@ -2153,9 +2214,7 @@ struct WidgetView: View {
     var footer: some View {
         HStack(spacing: 6) {
             if let r = store.report {
-                if !r.liveStatus.isEmpty {
-                    Label(r.liveStatus, systemImage: "exclamationmark.triangle").foregroundColor(.orange).lineLimit(1).help(r.liveStatus)
-                } else if !r.otherDevicesStatus.isEmpty {
+                if !r.otherDevicesStatus.isEmpty {
                     Label(r.otherDevicesStatus, systemImage: "exclamationmark.triangle").foregroundColor(.orange).lineLimit(1)
                         .help(r.otherDevicesStatus)
                 } else {
